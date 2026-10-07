@@ -1,0 +1,147 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+    # Docs-only changes don't need a new APK.
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Publish a GitHub Release (untick for a test build)
+        type: boolean
+        default: true
+
+# Least privilege by default; only the release job can write to the repo.
+permissions:
+  contents: read
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+# Third-party actions are pinned to full commit SHAs (tag in the trailing comment).
+jobs:
+  # Runs Gradle and its dependencies, so it gets a read-only token and no secrets.
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Java 17
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
+        with:
+          gradle-version: 8.14.3
+          cache-provider: basic
+
+      - name: Build release APK
+        # Unsigned; the release job signs it.
+        run: gradle --no-daemon assembleRelease
+
+      - name: Collect build output
+        run: |
+          mkdir -p out
+          cp app/build/outputs/apk/release/app-release-unsigned.apk out/
+          grep -m1 'versionName' app/build.gradle.kts | sed -E 's/.*"(.*)".*/\1/' > out/version.txt
+          cat out/version.txt
+
+      - name: Upload build output
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: build-output
+          path: out/
+          retention-days: 1
+          if-no-files-found: error
+
+  # Holds the signing key and the write token, and runs no project code.
+  release:
+    needs: build
+    if: github.event_name == 'push' || inputs.release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download build output
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: build-output
+          path: in
+
+      - name: Sign APK
+        env:
+          SIGNING_KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SIGNING_KEYSTORE_BASE64:-}" ] || [ -z "${SIGNING_STORE_PASSWORD:-}" ]; then
+            echo "::error::Signing secrets are missing. Add SIGNING_KEYSTORE_BASE64 and SIGNING_STORE_PASSWORD (see README → Signing)."
+            exit 1
+          fi
+          BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          KS="$RUNNER_TEMP/release.jks"
+          # Tolerate line breaks / Windows CRLF from however the secret was pasted.
+          printf '%s' "$SIGNING_KEYSTORE_BASE64" | tr -d '\r\n ' | base64 -d > "$KS"
+          export KS_PASS="$SIGNING_STORE_PASSWORD"
+          export KEY_PASS="${SIGNING_KEY_PASSWORD:-$SIGNING_STORE_PASSWORD}"
+          ALIAS="${SIGNING_KEY_ALIAS:-lumo}"
+
+          mkdir -p dist
+          "$BT/zipalign" -f -P 16 4 in/app-release-unsigned.apk "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign --ks "$KS" --ks-pass env:KS_PASS --ks-key-alias "$ALIAS" --key-pass env:KEY_PASS \
+            --out dist/glass-camera.apk "$RUNNER_TEMP/aligned.apk"
+          rm -f "$KS"
+          "$BT/zipalign" -c -P 16 4 dist/glass-camera.apk
+          "$BT/apksigner" verify --print-certs dist/glass-camera.apk | tee "$RUNNER_TEMP/certs.txt"
+          grep -m1 'certificate SHA-256 digest' "$RUNNER_TEMP/certs.txt" | sed 's/.*digest: //' > "$RUNNER_TEMP/cert-sha256.txt"
+          (cd dist && sha256sum *.apk > SHA256SUMS.txt)
+          ls -lh dist
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: glass-camera-apk
+          path: dist/
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="$(cat in/version.txt)"
+          TAG="v${VERSION}-build${{ github.run_number }}"
+          {
+            echo "## Install"
+            echo "Download **glass-camera.apk** below on your Android phone and open it (allow \"Install unknown apps\" when asked)."
+            echo
+            echo "## Verify"
+            echo "Signing certificate SHA-256:"
+            echo '```'
+            cat "$RUNNER_TEMP/cert-sha256.txt"
+            echo '```'
+            echo "File checksums (SHA-256):"
+            echo '```'
+            cat dist/SHA256SUMS.txt
+            echo '```'
+            echo "Built from ${{ github.sha }} on ${{ github.ref_name }}."
+          } > "$RUNNER_TEMP/notes.md"
+          gh release create "$TAG" dist/glass-camera.apk dist/SHA256SUMS.txt \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "Glass Camera $VERSION (build ${{ github.run_number }})" \
+            --latest \
+            --notes-file "$RUNNER_TEMP/notes.md"

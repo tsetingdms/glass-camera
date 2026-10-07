@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A glass lens: frosted ring, dark lens, bright reflection. Safe zone is the middle 66dp of 108dp. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#33FFFFFF"
+        android:strokeColor="#CCFFFFFF"
+        android:strokeWidth="2"
+        android:pathData="M30,54 A24,24 0 1,1 78,54 A24,24 0 1,1 30,54 Z" />
+    <path
+        android:fillColor="#E6101424"
+        android:pathData="M40,54 A14,14 0 1,1 68,54 A14,14 0 1,1 40,54 Z" />
+    <path
+        android:fillColor="#660A84FF"
+        android:pathData="M45,54 A9,9 0 1,1 63,54 A9,9 0 1,1 45,54 Z" />
+    <path
+        android:fillColor="#E6FFFFFF"
+        android:pathData="M47,49 A3.5,3.5 0 1,1 54,49 A3.5,3.5 0 1,1 47,49 Z" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#80FFFFFF"
+        android:strokeLineCap="round"
+        android:strokeWidth="2"
+        android:pathData="M38,40 A22,22 0 0,1 54,32" />
+</vector>
