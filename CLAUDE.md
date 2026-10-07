@@ -30,6 +30,13 @@ There's no Android SDK on the owner's PC, so builds run on GitHub: `gh workflow 
     orientation, background blurred at 1/8 with weights excluding the person (no halo), feathered composite.
   - `process/ImageSaver.kt` — MediaStore (DCIM/Glass Camera, no storage permission; `IS_PENDING`), EXIF orientation
     via `rotate()` then `flipHorizontally()` (front mirror) instead of rotating pixels; latest photo + thumbnail.
+  - `video/VideoProcessor.kt` — CameraX `SurfaceProcessor` (+ `VideoEffect` targeting PREVIEW | VIDEO_CAPTURE, bound
+    with a `UseCaseGroup` in Video mode). GL thread: OES camera texture → 1/4 → 1/16 downsamples (brightness map +
+    shake measurement via `glReadPixels`, SAD search ±6 px with sub-pixel fit) → process pass into a ping-pong history
+    FBO (stabilizing shift + 0.85 crop, local tone map, motion-adaptive temporal denoise) → each output drawn with
+    `inverse(stMatrix) × SurfaceOutput.updateTransformMatrix(...)`. Everything is measured and corrected in "frame
+    space" (SurfaceTexture matrix applied), so shift directions are right for any camera/orientation. Stable/Enhance
+    are volatile flags (no rebind). `video/Gl.kt` — EGL (recordable config) and GL helpers.
   - `ui/Glass.kt` — glass modifier, `tiltPress` (3D press), BarIcon, GlassCircleButton, Chip, GlassSwitch.
   - `ui/CameraScreen.kt` — top bar, viewfinder (PreviewView COMPATIBLE so it clips and composes), focus ring, zoom
     chips, Pro panel, mode switcher, shutter (progress arc), status card, toast, settings, permission screen.
@@ -46,6 +53,9 @@ There's no Android SDK on the owner's PC, so builds run on GitHub: `gh workflow 
   material-icons-extended (R8 strips unused).
 - Manifest removes INTERNET / ACCESS_NETWORK_STATE that ML Kit brings in; keep the app offline.
 - `largeHeap` is on for the 12 MP merges.
+- Video mode binds Preview (16:9) + VideoCapture (Recorder: FHD/HD, 20/10 Mbit/s) + the effect; no ImageCapture there.
+  Mode switches into/out of Video rebind. Mic permission is asked once on first Video use; without it videos are silent.
+  A recording ended by leaving the app finalizes with ERROR_SOURCE_INACTIVE but the file is kept.
 
 ## CI / releases
 

@@ -7,7 +7,8 @@
         android:required="true" />
 
     <uses-permission android:name="android.permission.CAMERA" />
-
+    <!-- Sound for videos; asked the first time Video mode is opened (videos record silently without it). -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- Fully offline: photos never leave the phone. ML Kit's bundled model needs no network,
          so the network permissions its libraries bring in are removed (this also blocks their usage logging). -->
     <uses-permission

@@ -15,8 +15,8 @@ android {
         // MediaStore RELATIVE_PATH / IS_PENDING (no storage permission needed) start at Android 10.
         minSdk = 29
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.1.0"
         // The Moto E40 and nearly every phone since 2017 are ARM; ML Kit's native libraries for x86 aren't needed.
         ndk {
             abiFilters += listOf("armeabi-v7a", "arm64-v8a")
@@ -69,6 +69,7 @@ dependencies {
     implementation("androidx.camera:camera-camera2:$camerax")
     implementation("androidx.camera:camera-lifecycle:$camerax")
     implementation("androidx.camera:camera-view:$camerax")
+    implementation("androidx.camera:camera-video:$camerax")
 
     implementation("androidx.exifinterface:exifinterface:1.4.2")
 

@@ -12,6 +12,10 @@ Everything happens on the phone: no internet permission, no account, no tracking
 - **Night** — 8 frames (6 on the front camera) aligned for hand shake and averaged, which removes most of the
   low-light grain, then brightened with local tone mapping.
 - **Portrait** — on-device person detection (ML Kit, offline) and a soft background blur.
+- **Video** — 1080p (or 720p) at a high bitrate, with sound. **Stable**: GCam-style software stabilization — each
+  frame's hand shake is measured against the previous one and cancelled within a 15 % crop. **Enhance**: local tone
+  mapping (brighter shadows, kept highlights) and motion-aware temporal noise reduction. Both run on the GPU and apply
+  to the viewfinder too, so what you see is what's recorded. Pause / resume, torch, timer. Saved to `Movies/Glass Camera`.
 - **Pro** — exposure compensation and white balance; ISO, shutter speed and manual focus where the phone's camera
   allows them (shown in Settings → This camera).
 

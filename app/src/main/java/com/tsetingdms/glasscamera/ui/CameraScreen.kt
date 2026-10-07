@@ -45,8 +45,10 @@ import androidx.compose.material.icons.rounded.GridOn
 import androidx.compose.material.icons.rounded.HdrOff
 import androidx.compose.material.icons.rounded.HdrOn
 import androidx.compose.material.icons.rounded.LightMode
+import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.Photo
+import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Timer10
 import androidx.compose.material.icons.rounded.Timer3
@@ -82,6 +84,7 @@ import com.tsetingdms.glasscamera.camera.CameraController
 import com.tsetingdms.glasscamera.camera.FlashMode
 import com.tsetingdms.glasscamera.camera.Mode
 import com.tsetingdms.glasscamera.camera.ProSetting
+import com.tsetingdms.glasscamera.camera.RecState
 import com.tsetingdms.glasscamera.camera.Status
 import com.tsetingdms.glasscamera.camera.evLabel
 import kotlinx.coroutines.delay
@@ -129,7 +132,11 @@ private fun TopBar(c: CameraController, rotation: Float) {
             modifier = Modifier.glass(RoundedCornerShape(50)).padding(horizontal = 6.dp, vertical = 2.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            if (c.front) {
+            if (c.mode == Mode.VIDEO) {
+                if (!c.front) {
+                    BarIcon(if (c.torch) Icons.Rounded.FlashOn else Icons.Rounded.FlashOff, if (c.torch) "Light on" else "Light off", rotation, active = c.torch) { c.cycleFlash() }
+                }
+            } else if (c.front) {
                 BarIcon(Icons.Rounded.LightMode, if (c.screenLight) "Screen light on" else "Screen light off", rotation, active = c.screenLight) { c.cycleFlash() }
             } else {
                 val (icon, text) = when (c.flash) {
@@ -178,6 +185,11 @@ private fun Viewfinder(c: CameraController, rotation: Float) {
                     c.attach(this)
                 }
             },
+            // Video is 16:9: show all of it (what you see is what's recorded).
+            update = { view ->
+                val type = if (c.mode == Mode.VIDEO) PreviewView.ScaleType.FIT_CENTER else PreviewView.ScaleType.FILL_CENTER
+                if (view.scaleType != type) view.scaleType = type
+            },
             modifier = Modifier.fillMaxSize(),
         )
         Box(
@@ -198,11 +210,19 @@ private fun Viewfinder(c: CameraController, rotation: Float) {
         )
         if (c.grid) GridLines()
         focus?.let { FocusRing(it, focusKey) }
-        if (c.mode == Mode.PRO) {
-            ProPanel(c, Modifier.align(Alignment.BottomCenter).padding(10.dp))
-        } else {
-            ZoomChips(c, rotation, Modifier.align(Alignment.BottomCenter).padding(bottom = 14.dp))
+        when (c.mode) {
+            Mode.PRO -> ProPanel(c, Modifier.align(Alignment.BottomCenter).padding(10.dp))
+            Mode.VIDEO -> Column(
+                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 14.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                VideoChips(c)
+                Spacer(Modifier.height(10.dp))
+                ZoomChips(c, rotation, Modifier)
+            }
+            else -> ZoomChips(c, rotation, Modifier.align(Alignment.BottomCenter).padding(bottom = 14.dp))
         }
+        if (c.recording) RecordingPill(c, Modifier.align(Alignment.TopCenter).padding(top = 12.dp))
         if (c.countdown > 0) {
             Label(
                 text = c.countdown.toString(),
@@ -213,6 +233,52 @@ private fun Viewfinder(c: CameraController, rotation: Float) {
         }
     }
 }
+
+@Composable
+private fun VideoChips(c: CameraController) {
+    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        Chip(if (c.videoStabilize) "Stable ✓" else "Stable", selected = c.videoStabilize) { c.toggleStabilize() }
+        Chip(if (c.videoEnhance) "Enhance ✓" else "Enhance", selected = c.videoEnhance) { c.toggleEnhance() }
+        Chip(if (c.video720) "720p" else "1080p", selected = false, enabled = !c.recording) { c.toggleVideoQuality() }
+    }
+}
+
+@Composable
+private fun RecordingPill(c: CameraController, modifier: Modifier) {
+    val blink = remember { Animatable(1f) }
+    LaunchedEffect(c.recState) {
+        if (c.recState == RecState.RECORDING) {
+            while (true) {
+                blink.animateTo(0.25f, tween(600))
+                blink.animateTo(1f, tween(600))
+            }
+        } else {
+            blink.snapTo(1f)
+        }
+    }
+    val m = c.recSeconds / 60
+    val sec = c.recSeconds % 60
+    Row(
+        modifier = modifier.glass(RoundedCornerShape(50)).padding(horizontal = 14.dp, vertical = 7.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            Modifier
+                .size(10.dp)
+                .graphicsLayer { alpha = blink.value }
+                .clip(CircleShape)
+                .background(if (c.recState == RecState.PAUSED) Accent else RecordRed),
+        )
+        Spacer(Modifier.width(8.dp))
+        Label(
+            text = "%02d:%02d".format(m, sec) + if (c.recState == RecState.PAUSED) "  Paused" else "",
+            size = 14.sp,
+            weight = FontWeight.SemiBold,
+        )
+    }
+}
+
+private val RecordRed = Color(0xFFFF3B30)
 
 @Composable
 private fun GridLines() {
@@ -389,8 +455,12 @@ private fun Unavailable(text: String) {
 private fun ModeSwitcher(c: CameraController) {
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
         Row(
-            modifier = Modifier.glass(RoundedCornerShape(50)).padding(4.dp),
-            horizontalArrangement = Arrangement.spacedBy(2.dp),
+            modifier = Modifier
+                .padding(horizontal = 8.dp)
+                .glass(RoundedCornerShape(50))
+                .horizontalScroll(rememberScrollState())
+                .padding(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(1.dp),
         ) {
             Mode.entries.forEach { m ->
                 val selected = m == c.mode
@@ -399,9 +469,9 @@ private fun ModeSwitcher(c: CameraController) {
                         .tiltPress(m.label, maxDegrees = 10f) { c.selectMode(m) }
                         .clip(RoundedCornerShape(50))
                         .background(if (selected) Color.White.copy(alpha = 0.92f) else Color.Transparent)
-                        .padding(horizontal = 15.dp, vertical = 9.dp),
+                        .padding(horizontal = 11.dp, vertical = 9.dp),
                 ) {
-                    Label(m.label, color = if (selected) Color.Black else Color.White, size = 14.sp, weight = FontWeight.SemiBold)
+                    Label(m.label, color = if (selected) Color.Black else Color.White, size = 13.5.sp, weight = FontWeight.SemiBold)
                 }
             }
         }
@@ -415,10 +485,19 @@ private fun BottomBar(c: CameraController, rotation: Float) {
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Thumbnail(c, rotation)
+        if (c.recording) {
+            val paused = c.recState == RecState.PAUSED
+            GlassCircleButton(if (paused) Icons.Rounded.PlayArrow else Icons.Rounded.Pause, if (paused) "Resume" else "Pause", 58.dp, rotation) { c.togglePause() }
+        } else {
+            Thumbnail(c, rotation)
+        }
         Shutter(c, rotation)
-        val flip by animateFloatAsState(if (c.front) 180f else 0f, spring(dampingRatio = 0.6f, stiffness = 300f), label = "flip")
-        GlassCircleButton(Icons.Rounded.Cameraswitch, "Switch camera", 58.dp, rotation, iconFlip = flip) { c.toggleFront() }
+        if (c.recording) {
+            Spacer(Modifier.size(58.dp))
+        } else {
+            val flip by animateFloatAsState(if (c.front) 180f else 0f, spring(dampingRatio = 0.6f, stiffness = 300f), label = "flip")
+            GlassCircleButton(Icons.Rounded.Cameraswitch, "Switch camera", 58.dp, rotation, iconFlip = flip) { c.toggleFront() }
+        }
     }
 }
 
@@ -456,10 +535,24 @@ private fun Shutter(c: CameraController, rotation: Float) {
     Box(
         modifier = Modifier
             .size(84.dp)
-            .tiltPress("Take photo", enabled = !c.busy, maxDegrees = 12f) { c.shutter() }
+            .tiltPress(
+                label = when {
+                    c.recording -> "Stop recording"
+                    c.mode == Mode.VIDEO -> "Start recording"
+                    else -> "Take photo"
+                },
+                enabled = !c.busy || c.recording,
+                maxDegrees = 12f,
+            ) { c.shutter() }
             .glass(CircleShape),
         contentAlignment = Alignment.Center,
     ) {
+        if (c.mode == Mode.VIDEO) {
+            val size by animateFloatAsState(if (c.recording) 30f else 62f, spring(dampingRatio = 0.7f, stiffness = 500f), label = "rec")
+            val corner by animateFloatAsState(if (c.recording) 8f else 31f, spring(dampingRatio = 0.7f, stiffness = 500f), label = "corner")
+            Box(Modifier.size(size.dp).clip(RoundedCornerShape(corner.dp)).background(RecordRed))
+            return@Box
+        }
         val inner = if (c.busy) Color.White.copy(alpha = 0.55f) else Color.White
         Box(Modifier.size(64.dp).clip(CircleShape).background(inner))
         val icon = when (c.mode) {

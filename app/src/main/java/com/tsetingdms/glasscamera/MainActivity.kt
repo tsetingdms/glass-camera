@@ -29,6 +29,7 @@ class MainActivity : ComponentActivity() {
     private var granted by mutableStateOf(false)
 
     private val requestCamera = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted = it }
+    private val requestMic = registerForActivityResult(ActivityResultContracts.RequestPermission()) { controller.onMicResult(it) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge(
@@ -39,6 +40,7 @@ class MainActivity : ComponentActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         controller = CameraController(this)
+        controller.requestMic = { requestMic.launch(Manifest.permission.RECORD_AUDIO) }
         granted = hasCamera()
         // The screen stays portrait; icons turn and photos are saved upright from the phone's real orientation.
         orientation = object : OrientationEventListener(this) {
@@ -71,6 +73,11 @@ class MainActivity : ComponentActivity() {
     override fun onPause() {
         orientation.disable()
         super.onPause()
+    }
+
+    override fun onDestroy() {
+        controller.release()
+        super.onDestroy()
     }
 
     // Volume buttons work as a shutter, like most camera apps.

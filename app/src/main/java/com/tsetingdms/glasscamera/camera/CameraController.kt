@@ -1,8 +1,12 @@
 package com.tsetingdms.glasscamera.camera
 
+import android.Manifest
+import android.annotation.SuppressLint
 import android.content.ActivityNotFoundException
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.ImageFormat
 import android.hardware.camera2.CameraCharacteristics
@@ -25,15 +29,24 @@ import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
+import androidx.camera.core.UseCaseGroup
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionFilter
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.view.PreviewView
-import androidx.compose.runtime.getValue
+import androidx.camera.video.FallbackStrategy
+import androidx.camera.video.MediaStoreOutputOptions
+import androidx.camera.video.Quality
+import androidx.camera.video.QualitySelector
+import androidx.camera.video.Recorder
+import androidx.camera.video.Recording
+import androidx.camera.video.VideoCapture
+import androidx.camera.video.VideoRecordEvent
+import androidx.camera.view.PreviewViewimport androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
@@ -44,6 +57,8 @@ import com.tsetingdms.glasscamera.process.BurstMerge
 import com.tsetingdms.glasscamera.process.ImageSaver
 import com.tsetingdms.glasscamera.process.MergeParams
 import com.tsetingdms.glasscamera.process.Portrait
+import com.tsetingdms.glasscamera.video.VideoEffect
+import com.tsetingdms.glasscamera.video.VideoProcessor
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -51,6 +66,9 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -60,7 +78,9 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
 
-enum class Mode(val label: String) { NIGHT("Night"), PORTRAIT("Portrait"), PHOTO("Photo"), PRO("Pro") }
+enum class Mode(val label: String) { NIGHT("Night"), PORTRAIT("Portrait"), PHOTO("Photo"), VIDEO("Video"), PRO("Pro") }
+
+enum class RecState { IDLE, RECORDING, PAUSED }
 
 enum class FlashMode { OFF, AUTO, ON }
 
@@ -125,6 +145,23 @@ class CameraController(private val activity: ComponentActivity) {
     var shutterSound by mutableStateOf(prefs.getBoolean("shutterSound", true))
         private set
 
+    // Video
+    var videoStabilize by mutableStateOf(prefs.getBoolean("videoStabilize", true))
+        private set
+    var videoEnhance by mutableStateOf(prefs.getBoolean("videoEnhance", true))
+        private set
+    var video720 by mutableStateOf(prefs.getBoolean("video720", false))
+        private set
+    var torch by mutableStateOf(false)
+        private set
+    var recState by mutableStateOf(RecState.IDLE)
+        private set
+    var recSeconds by mutableLongStateOf(0L)
+        private set
+    val recording get() = recState != RecState.IDLE
+
+    /** Asks the activity for the microphone permission (video sound). */
+    var requestMic: (() -> Unit)? = null
     var caps by mutableStateOf<Caps?>(null)
         private set
     var zoom by mutableFloatStateOf(1f)
@@ -169,12 +206,22 @@ class CameraController(private val activity: ComponentActivity) {
     private var previewView: PreviewView? = null
     private var camera: Camera? = null
     private var imageCapture: ImageCapture? = null
-    private var boundBurst = false
+    private var videoCapture: VideoCapture<Recorder>? = null
+    private var activeRecording: Recording? = null
+    private var lastIsVideo = false
+
+    // GPU stabilization + enhancement for Video mode (created when first needed).
+    private var processor: VideoProcessor? = null
+    private var effect: VideoEffect? = null    private var boundBurst = false
     private var deviceRotation = Surface.ROTATION_0
     private var lastUri: Uri? = null
 
     private val previewSelector = ResolutionSelector.Builder()
         .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+        .build()
+
+    private val videoPreviewSelector = ResolutionSelector.Builder()
+        .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
         .build()
 
     // Largest 4:3 picture up to ~13 MP: the sensor's binned 12 MP mode is its cleanest, and it keeps
@@ -227,6 +274,12 @@ class CameraController(private val activity: ComponentActivity) {
         val burst = usesBurst()
         try {
             p.unbindAll()
+            torch = false
+            if (mode == Mode.VIDEO) {
+                bindVideo(p, view)
+                return
+            }
+            videoCapture = null
             val preview = Preview.Builder().setResolutionSelector(previewSelector).build()
             preview.setSurfaceProvider(view.surfaceProvider)
             val capture = ImageCapture.Builder()
@@ -251,6 +304,41 @@ class CameraController(private val activity: ComponentActivity) {
         } catch (e: Exception) {
             message = if (front) "Front camera not available" else "Camera not available"
         }
+    }
+
+    private fun bindVideo(p: ProcessCameraProvider, view: PreviewView) {
+        val proc = processor ?: VideoProcessor().also { processor = it }
+        val fx = effect ?: VideoEffect(proc).also { effect = it }
+        proc.stabilize = videoStabilize
+        proc.enhance = videoEnhance
+        val quality = if (video720) Quality.HD else Quality.FHD
+        val recorder = Recorder.Builder()
+            .setQualitySelector(QualitySelector.from(quality, FallbackStrategy.lowerQualityOrHigherThan(Quality.HD)))
+            // More detail than typical phone defaults (about 12–17 Mbit/s at 1080p).
+            .setTargetVideoEncodingBitRate(if (video720) 10_000_000 else 20_000_000)
+            .build()
+        val video = VideoCapture.Builder(recorder).setTargetRotation(deviceRotation).build()
+        // Same 16:9 shape as the video, so the viewfinder shows exactly what is recorded.
+        val preview = Preview.Builder().setResolutionSelector(videoPreviewSelector).build()
+        preview.setSurfaceProvider(view.surfaceProvider)
+        val group = UseCaseGroup.Builder()
+            .addUseCase(preview)
+            .addUseCase(video)
+            .addEffect(fx)
+            .build()
+        val selector = if (front) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
+        val cam = p.bindToLifecycle(activity, selector, group)
+        camera = cam
+        imageCapture = null
+        videoCapture = video
+        boundBurst = false
+        caps = readCaps(cam)
+        cam.cameraInfo.zoomState.observe(activity) { state ->
+            zoom = state.zoomRatio
+            minZoom = state.minZoomRatio
+            maxZoom = state.maxZoomRatio
+        }
+        applyPro()
     }
 
     private fun rebindIfNeeded() {
@@ -289,14 +377,47 @@ class CameraController(private val activity: ComponentActivity) {
     // region Controls
 
     fun selectMode(value: Mode) {
-        if (busy || value == mode) return
+        if (busy || recording || value == mode) return
+        val videoChanged = (value == Mode.VIDEO) != (mode == Mode.VIDEO)
         mode = value
         prefs.edit { putString("mode", value.name) }
-        rebindIfNeeded()
+        if (videoChanged) bind() else rebindIfNeeded()
+        if (value == Mode.VIDEO && !hasMic() && !prefs.getBoolean("micAsked", false)) {
+            prefs.edit { putBoolean("micAsked", true) }
+            requestMic?.invoke()
+        }
+    }
+
+    fun onMicResult(granted: Boolean) {
+        if (!granted) message = "Videos will be recorded without sound"
+    }
+
+    private fun hasMic() =
+        ContextCompat.checkSelfPermission(activity, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+    fun toggleStabilize() {
+        videoStabilize = !videoStabilize
+        prefs.edit { putBoolean("videoStabilize", videoStabilize) }
+        processor?.stabilize = videoStabilize
+        message = if (videoStabilize) "Stabilization on (slight crop)" else "Stabilization off"
+    }
+
+    fun toggleEnhance() {
+        videoEnhance = !videoEnhance
+        prefs.edit { putBoolean("videoEnhance", videoEnhance) }
+        processor?.enhance = videoEnhance
+        message = if (videoEnhance) "Enhance on: brighter shadows, less noise" else "Enhance off"
+    }
+
+    fun toggleVideoQuality() {
+        if (recording) return
+        video720 = !video720
+        prefs.edit { putBoolean("video720", video720) }
+        if (mode == Mode.VIDEO) bind()
     }
 
     fun toggleFront() {
-        if (busy) return
+        if (busy || recording) return
         front = !front
         prefs.edit { putBoolean("front", front) }
         proFocus = null
@@ -304,6 +425,13 @@ class CameraController(private val activity: ComponentActivity) {
     }
 
     fun cycleFlash() {
+        if (mode == Mode.VIDEO) {
+            if (front) return
+            val cam = camera ?: return
+            torch = !torch
+            cam.cameraControl.enableTorch(torch)
+            return
+        }
         if (front) {
             screenLight = !screenLight
             prefs.edit { putBoolean("screenLight", screenLight) }
@@ -375,6 +503,7 @@ class CameraController(private val activity: ComponentActivity) {
         if (rotation == deviceRotation) return
         deviceRotation = rotation
         imageCapture?.targetRotation = rotation
+        if (!recording) videoCapture?.targetRotation = rotation
         val target = when (rotation) {
             Surface.ROTATION_90 -> 90f
             Surface.ROTATION_180 -> 180f
@@ -392,7 +521,7 @@ class CameraController(private val activity: ComponentActivity) {
         try {
             activity.startActivity(
                 Intent(Intent.ACTION_VIEW)
-                    .setDataAndType(uri, "image/*")
+                    .setDataAndType(uri, if (lastIsVideo) "video/*" else "image/*")
                     .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             )
         } catch (e: ActivityNotFoundException) {
@@ -465,6 +594,10 @@ class CameraController(private val activity: ComponentActivity) {
     // region Capture
 
     fun shutter() {
+        if (mode == Mode.VIDEO) {
+            if (recording) stopRecording() else if (!busy) startRecordingAfterTimer()
+            return
+        }
         if (busy || camera == null || imageCapture == null) return
         busy = true
         activity.lifecycleScope.launch {
@@ -643,10 +776,96 @@ class CameraController(private val activity: ComponentActivity) {
         }
     }
 
-    private suspend fun saved(uri: Uri) {
+    private suspend fun saved(uri: Uri, video: Boolean = false) {
         lastUri = uri
+        lastIsVideo = video
         thumbnail = withContext(Dispatchers.IO) { ImageSaver.thumbnail(activity, uri) }
     }
+
+    // region Video recording
+
+    private fun startRecordingAfterTimer() {
+        if (videoCapture == null) return
+        busy = true
+        activity.lifecycleScope.launch {
+            try {
+                if (timer > 0) {
+                    for (i in timer downTo 1) {
+                        countdown = i
+                        delay(1000)
+                    }
+                }
+                countdown = 0
+                startRecording()
+            } finally {
+                countdown = 0
+                busy = false
+            }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startRecording() {
+        val vc = videoCapture ?: return
+        val values = ContentValues().apply {
+            put(MediaStore.Video.Media.DISPLAY_NAME, "VID_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".mp4")
+            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+            put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/Glass Camera")
+        }
+        val options = MediaStoreOutputOptions.Builder(activity.contentResolver, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+            .setContentValues(values)
+            .build()
+        var pending = vc.output.prepareRecording(activity, options)
+        if (hasMic()) pending = pending.withAudioEnabled()
+        if (shutterSound) sound.play(MediaActionSound.START_VIDEO_RECORDING)
+        recSeconds = 0
+        recState = RecState.RECORDING
+        activeRecording = pending.start(ContextCompat.getMainExecutor(activity)) { event -> onRecordEvent(event) }
+    }
+
+    fun togglePause() {
+        val rec = activeRecording ?: return
+        if (recState == RecState.RECORDING) rec.pause() else if (recState == RecState.PAUSED) rec.resume()
+    }
+
+    private fun stopRecording() {
+        if (shutterSound) sound.play(MediaActionSound.STOP_VIDEO_RECORDING)
+        activeRecording?.stop()
+        activeRecording = null
+    }
+
+    private fun onRecordEvent(event: VideoRecordEvent) {
+        when (event) {
+            is VideoRecordEvent.Status -> recSeconds = event.recordingStats.recordedDurationNanos / 1_000_000_000L
+            is VideoRecordEvent.Pause -> recState = RecState.PAUSED
+            is VideoRecordEvent.Resume -> recState = RecState.RECORDING
+            is VideoRecordEvent.Finalize -> {
+                activeRecording = null
+                recState = RecState.IDLE
+                recSeconds = 0
+                val uri = event.outputResults.outputUri
+                // Leaving the app mid-recording ends it with "source inactive"; the file is still good.
+                val ok = uri != Uri.EMPTY && (!event.hasError() || event.error == VideoRecordEvent.Finalize.ERROR_SOURCE_INACTIVE)
+                if (ok) {
+                    activity.lifecycleScope.launch { saved(uri, video = true) }
+                } else {
+                    message = "The video couldn't be saved"
+                }
+            }
+            else -> Unit
+        }
+    }
+
+    /** Stops recording and frees the GPU pipeline; call when the activity is destroyed. */
+    fun release() {
+        activeRecording?.stop()
+        activeRecording = null
+        processor?.release()
+        processor = null
+        effect = null
+    }
+
+    // endregion
 
     private fun post(block: () -> Unit) {
         activity.lifecycleScope.launch(Dispatchers.Main) { block() }
