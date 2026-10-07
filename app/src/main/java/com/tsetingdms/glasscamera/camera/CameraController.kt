@@ -420,7 +420,8 @@ class CameraController(private val activity: ComponentActivity) {
         val capabilities = info.getCameraCharacteristic(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: IntArray(0)
         val noiseModes = info.getCameraCharacteristic(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES) ?: IntArray(0)
         val streams = info.getCameraCharacteristic(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-        val photoSizes = streams?.getOutputSizes(ImageFormat.JPEG).orEmpty() + streams?.getHighResolutionOutputSizes(ImageFormat.JPEG).orEmpty()
+        val photoSizes = streams?.getOutputSizes(ImageFormat.JPEG)?.toList().orEmpty() +
+            streams?.getHighResolutionOutputSizes(ImageFormat.JPEG)?.toList().orEmpty()
         val exposure = cam.cameraInfo.exposureState
         return Caps(
             level = level,
