@@ -16,6 +16,7 @@ import android.media.MediaActionSound
 import android.net.Uri
 import android.provider.MediaStore
 import android.util.Range
+import android.util.Size
 import android.view.Surface
 import androidx.activity.ComponentActivity
 import androidx.camera.camera2.interop.Camera2CameraControl
@@ -104,11 +105,16 @@ class Caps(
     val hasFlash: Boolean,
     /** Lightest noise reduction apps may ask the chip for (MINIMAL, else OFF); null = only its own smoothing. */
     val rawNoise: Int?,
+    /** Largest photo the camera gives apps (normal and "high resolution" sizes). */
+    val maxPhoto: Size?,
 ) {
     val manualFocus get() = manualSensor && minFocus > 0f
 
     /** Night shots can skip the chip's smoothing ("Natural detail"). */
     val detailControl get() = rawNoise != null
+
+    /** Megapixels of the largest photo, rounded. */
+    val maxMegapixels get() = maxPhoto?.let { (it.width.toLong() * it.height / 1_000_000.0).roundToInt() } ?: 0
 }
 
 private class Shot(val jpeg: ByteArray, val rotation: Int)
@@ -153,6 +159,10 @@ class CameraController(private val activity: ComponentActivity) {
 
     /** Night takes twice as many frames (16 on the back camera). */
     var night16 by mutableStateOf(prefs.getBoolean("night16", false))
+        private set
+
+    /** Photo mode on the back camera saves the sensor's full resolution (48 MP on the E40), single shots only. */
+    var hiRes by mutableStateOf(prefs.getBoolean("hiRes", false))
         private set
 
     /** Night asks the chip for unsmoothed frames; merging 8–16 of them removes the grain instead. */
@@ -228,6 +238,10 @@ class CameraController(private val activity: ComponentActivity) {
     private var processor: VideoProcessor? = null
     private var effect: VideoEffect? = null
     private var boundBurst = false
+    private var boundHiRes = false
+
+    /** Say which resolution was bound after the next bind (the user just switched 48 MP on). */
+    private var announceHiRes = false
     private var deviceRotation = Surface.ROTATION_0
     private var lastUri: Uri? = null
 
@@ -237,6 +251,14 @@ class CameraController(private val activity: ComponentActivity) {
 
     private val videoPreviewSelector = ResolutionSelector.Builder()
         .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
+        .build()
+
+    // Full resolution for the 48 MP option. Such sizes are often listed as "high resolution" (slower than 20 fps),
+    // which CameraX only picks when allowed to.
+    private val hiResSelector = ResolutionSelector.Builder()
+        .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+        .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
+        .setAllowedResolutionMode(ResolutionSelector.PREFER_HIGHER_RESOLUTION_OVER_CAPTURE_RATE)
         .build()
 
     // Largest 4:3 picture up to ~13 MP: the sensor's binned 12 MP mode is its cleanest, and it keeps
@@ -277,9 +299,11 @@ class CameraController(private val activity: ComponentActivity) {
         }, ContextCompat.getMainExecutor(activity))
     }
 
+    private fun usesHiRes() = hiRes && mode == Mode.PHOTO && !front
+
     private fun usesBurst() = when (mode) {
         Mode.NIGHT -> true
-        Mode.PHOTO -> hdr || (front && cleanSelfies)
+        Mode.PHOTO -> (hdr && !usesHiRes()) || (front && cleanSelfies)
         else -> false
     }
 
@@ -287,6 +311,7 @@ class CameraController(private val activity: ComponentActivity) {
         val p = provider ?: return
         val view = previewView ?: return
         val burst = usesBurst()
+        val full = usesHiRes()
         try {
             p.unbindAll()
             torch = false
@@ -300,16 +325,36 @@ class CameraController(private val activity: ComponentActivity) {
             val capture = ImageCapture.Builder()
                 // Bursts need frames quickly; single shots get the slower, cleaner processing.
                 .setCaptureMode(if (burst) ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY else ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
-                .setResolutionSelector(captureSelector)
+                .setResolutionSelector(if (full) hiResSelector else captureSelector)
                 .setJpegQuality(95)
                 .setTargetRotation(deviceRotation)
                 .build()
             val selector = if (front) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
-            val cam = p.bindToLifecycle(activity, selector, preview, capture)
+            val cam = try {
+                p.bindToLifecycle(activity, selector, preview, capture)
+            } catch (e: IllegalArgumentException) {
+                if (!full) throw e
+                // The camera can't stream the viewfinder alongside full-resolution photos: back to normal size.
+                hiRes = false
+                prefs.edit { putBoolean("hiRes", false) }
+                announceHiRes = false
+                message = "This phone can't take full-resolution photos in this app"
+                bind()
+                return
+            }
             camera = cam
             imageCapture = capture
             boundBurst = burst
+            boundHiRes = full
             caps = readCaps(cam)
+            if (announceHiRes) {
+                announceHiRes = false
+                val size = capture.resolutionInfo?.resolution
+                if (full && size != null) {
+                    val mp = (size.width.toLong() * size.height / 1_000_000.0).roundToInt()
+                    message = "Full resolution: $mp MP (${size.width}×${size.height})"
+                }
+            }
             cam.cameraInfo.zoomState.observe(activity) { state ->
                 zoom = state.zoomRatio
                 minZoom = state.minZoomRatio
@@ -347,6 +392,7 @@ class CameraController(private val activity: ComponentActivity) {
         imageCapture = null
         videoCapture = video
         boundBurst = false
+        boundHiRes = false
         caps = readCaps(cam)
         cam.cameraInfo.zoomState.observe(activity) { state ->
             zoom = state.zoomRatio
@@ -357,7 +403,7 @@ class CameraController(private val activity: ComponentActivity) {
     }
 
     private fun rebindIfNeeded() {
-        if (usesBurst() != boundBurst) bind() else applyPro()
+        if (usesBurst() != boundBurst || usesHiRes() != boundHiRes) bind() else applyPro()
     }
 
     @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
@@ -373,6 +419,8 @@ class CameraController(private val activity: ComponentActivity) {
         }
         val capabilities = info.getCameraCharacteristic(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: IntArray(0)
         val noiseModes = info.getCameraCharacteristic(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES) ?: IntArray(0)
+        val streams = info.getCameraCharacteristic(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val photoSizes = streams?.getOutputSizes(ImageFormat.JPEG).orEmpty() + streams?.getHighResolutionOutputSizes(ImageFormat.JPEG).orEmpty()
         val exposure = cam.cameraInfo.exposureState
         return Caps(
             level = level,
@@ -391,6 +439,7 @@ class CameraController(private val activity: ComponentActivity) {
                 CameraMetadata.NOISE_REDUCTION_MODE_OFF in noiseModes -> CameraMetadata.NOISE_REDUCTION_MODE_OFF
                 else -> null
             },
+            maxPhoto = photoSizes.maxByOrNull { it.width.toLong() * it.height },
         )
     }
 
@@ -467,6 +516,24 @@ class CameraController(private val activity: ComponentActivity) {
         hdr = !hdr
         prefs.edit { putBoolean("hdr", hdr) }
         message = if (hdr) "HDR on: brighter shadows, safer skies" else "HDR off"
+        if (hdr && hiRes) {
+            hiRes = false
+            prefs.edit { putBoolean("hiRes", false) }
+            message = "HDR on — full resolution off (HDR merges 12 MP frames)"
+        }
+        rebindIfNeeded()
+    }
+
+    fun toggleHiRes() {
+        if (busy) return
+        hiRes = !hiRes
+        prefs.edit { putBoolean("hiRes", hiRes) }
+        if (hiRes && hdr) {
+            hdr = false
+            prefs.edit { putBoolean("hdr", false) }
+        }
+        announceHiRes = hiRes
+        if (!hiRes) message = "12 MP: cleaner in low light, smaller files"
         rebindIfNeeded()
     }
 
@@ -660,7 +727,7 @@ class CameraController(private val activity: ComponentActivity) {
     }
 
     private suspend fun capture() {
-        if (usesBurst() != boundBurst) bind()
+        if (usesBurst() != boundBurst || usesHiRes() != boundHiRes) bind()
         val ic = imageCapture ?: return
         val mirror = front && mirrorFront
 

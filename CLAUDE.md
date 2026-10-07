@@ -19,7 +19,9 @@ There's no Android SDK on the owner's PC, so builds run on GitHub: `gh workflow 
 - `app/src/main/java/com/tsetingdms/glasscamera/`
   - `MainActivity.kt` — permission, edge-to-edge, `OrientationEventListener` (screen locked portrait; icons rotate
     and `ImageCapture.targetRotation` follows the phone), volume keys = shutter, keep screen on.
-  - `camera/CameraController.kt` — CameraX binding (Preview + ImageCapture, 4:3, capture ≤ 13 MP), Compose state for
+  - `camera/CameraController.kt` — CameraX binding (Preview + ImageCapture, 4:3, capture ≤ 13 MP; the "48M" toggle
+    binds `hiResSelector` = highest size incl. high-resolution sizes, Photo mode + back camera + single shots only,
+    falls back to 12 MP if binding fails; `Caps.maxPhoto` decides whether the toggle shows), Compose state for
     the UI, settings in SharedPreferences `glass_camera`, capture flows, Pro controls via Camera2 interop
     (`Camera2CameraControl` capture-request options), capability read-out (`Caps`).
   - `process/BurstMerge.kt` — multi-frame pipeline (Night 8/16 / HDR / Clean selfies): sharpest frame as
@@ -68,6 +70,14 @@ There's no Android SDK on the owner's PC, so builds run on GitHub: `gh workflow 
 - Video mode binds Preview (16:9) + VideoCapture (Recorder: FHD/HD, 20/10 Mbit/s) + the effect; no ImageCapture there.
   Mode switches into/out of Video rebind. Mic permission is asked once on first Video use; without it videos are silent.
   A recording ended by leaving the app finalizes with ERROR_SOURCE_INACTIVE but the file is kept.
+
+## Night tuning status (parked)
+
+Measured on the E40 against the stock camera's Night (same cupboard scene, 1500 px crops; grain = std of
+image − blur, sharpness = 99th percentile of horizontal gradient):
+1.2.3 Night 16 + Natural detail: grain 0.92 / 1.71, sharpness label 12 / handle 46, brightness 99;
+stock Night: 0.71 / 1.03, 18 / 51, 138. Open items: brighter tone curve (stock is ~40 % brighter), stronger local
+contrast for text, a gentle post-merge grain filter (sharpen 0.6 also lifts grain). Edges are clean since 1.2.3.
 
 ## CI / releases
 

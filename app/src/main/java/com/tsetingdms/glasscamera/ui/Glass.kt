@@ -143,6 +143,25 @@ fun BarIcon(icon: ImageVector, label: String, rotation: Float, active: Boolean =
     }
 }
 
+/** Text toggle for the top bar (e.g. "48M"), styled like [BarIcon]. */
+@Composable
+fun BarText(text: String, label: String, rotation: Float, active: Boolean = false, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .size(44.dp)
+            .tiltPress(label, maxDegrees = 18f, onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Label(
+            text = text,
+            color = if (active) Accent else Color.White,
+            size = 12.sp,
+            weight = FontWeight.Bold,
+            modifier = Modifier.graphicsLayer { rotationZ = rotation },
+        )
+    }
+}
+
 /** Round glass button with an icon. */
 @Composable
 fun GlassCircleButton(

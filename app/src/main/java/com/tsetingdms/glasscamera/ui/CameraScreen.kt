@@ -148,6 +148,11 @@ private fun TopBar(c: CameraController, rotation: Float) {
             }
             if (c.mode == Mode.PHOTO) {
                 BarIcon(if (c.hdr) Icons.Rounded.HdrOn else Icons.Rounded.HdrOff, if (c.hdr) "HDR on" else "HDR off", rotation, active = c.hdr) { c.toggleHdr() }
+                val mp = c.caps?.maxMegapixels ?: 0
+                // Only when the phone offers more than the usual 12 MP to apps.
+                if (!c.front && mp > 20) {
+                    BarText("${mp}M", if (c.hiRes) "$mp MP on" else "$mp MP off", rotation, active = c.hiRes) { c.toggleHiRes() }
+                }
             }
             val timerIcon = when (c.timer) {
                 3 -> Icons.Rounded.Timer3
@@ -685,7 +690,8 @@ private fun SettingsSheet(c: CameraController) {
                 Label(
                     "Camera2 level: ${caps.level} · Manual ISO/shutter: ${if (caps.manualSensor) "yes" else "no"} · " +
                         "Focus: ${if (caps.minFocus > 0f) "auto" else "fixed"} · Flash: ${if (caps.hasFlash) "yes" else "no"} · " +
-                        "Smoothing control: $smoothing",
+                        "Smoothing control: $smoothing · Largest photo: " +
+                        (caps.maxPhoto?.let { "${it.width}×${it.height} (${caps.maxMegapixels} MP)" } ?: "unknown"),
                     color = Color.White.copy(alpha = 0.85f),
                     size = 12.sp,
                 )

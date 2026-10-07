@@ -8,7 +8,9 @@ Everything happens on the phone: no internet permission, no account, no tracking
 ## Modes
 
 - **Photo** — one shot from the camera's own processing. Optional **HDR**: 4 frames taken ~1 EV darker
-  (bright skies keep their detail), aligned and merged, then the shadows are lifted.
+  (bright skies keep their detail), aligned and merged, then the shadows are lifted. Optional **48M** (top bar,
+  back camera, only shown when the phone offers more than 12 MP to apps): the sensor's full resolution — most detail
+  in good light; 12 MP is cleaner in dim light. HDR and 48M are either/or.
 - **Night** — 8 or 16 frames (6 or 12 on the front camera) aligned for hand shake and averaged, which removes most
   of the low-light grain, then brightened with local tone mapping and sharpened. Alignment is per 64-pixel tile,
   refined at full resolution to a fraction of a pixel, so a slightly turning hand or small movements still line up;
