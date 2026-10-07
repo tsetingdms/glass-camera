@@ -50,7 +50,7 @@ There's no Android SDK on the owner's PC, so builds run on GitHub: `gh workflow 
 ## CI / releases
 
 `.github/workflows/build.yml`: `build` (no secrets, read-only) → unsigned APK artifact + version; `release`
-(contents: write, only job with secrets) zipaligns and signs with `SIGNING_*` secrets (same key as Lumo; fails if
+(contents: write, only job with secrets) zipaligns and signs with `SIGNING_*` secrets (its own key, alias `camera`, kept on the owner's PC as `Documents\glass-camera-release.jks`; fails if
 missing), publishes `v<versionName>-build<run>` marked latest. Actions pinned to SHAs. Bump `versionCode` /
 `versionName` in `app/build.gradle.kts` for each release.
 Commit and push only when asked; never force-push.

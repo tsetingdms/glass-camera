@@ -30,6 +30,6 @@ Locally (needs JDK 17, the Android SDK and Gradle 8.14): `gradle assembleRelease
 ## Signing
 
 The release job signs the APK with secrets set in **Settings → Secrets and variables → Actions**:
-`SIGNING_KEYSTORE_BASE64`, `SIGNING_STORE_PASSWORD`, and optionally `SIGNING_KEY_ALIAS` (default `lumo`) and
-`SIGNING_KEY_PASSWORD` (default = store password). Keep using the same key: Android only installs updates signed
+`SIGNING_KEYSTORE_BASE64`, `SIGNING_STORE_PASSWORD`, and optionally `SIGNING_KEY_ALIAS` (default `camera`) and
+`SIGNING_KEY_PASSWORD` (default = store password). The camera has its own key (`glass-camera-release.jks`, alias `camera`). Keep using it: Android only installs updates signed
 with the key the app was first installed with.

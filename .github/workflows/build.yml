@@ -97,7 +97,7 @@ jobs:
           printf '%s' "$SIGNING_KEYSTORE_BASE64" | tr -d '\r\n ' | base64 -d > "$KS"
           export KS_PASS="$SIGNING_STORE_PASSWORD"
           export KEY_PASS="${SIGNING_KEY_PASSWORD:-$SIGNING_STORE_PASSWORD}"
-          ALIAS="${SIGNING_KEY_ALIAS:-lumo}"
+          ALIAS="${SIGNING_KEY_ALIAS:-camera}"
 
           mkdir -p dist
           "$BT/zipalign" -f -P 16 4 in/app-release-unsigned.apk "$RUNNER_TEMP/aligned.apk"
