@@ -43,7 +43,8 @@ import androidx.camera.video.Recorder
 import androidx.camera.video.Recording
 import androidx.camera.video.VideoCapture
 import androidx.camera.video.VideoRecordEvent
-import androidx.camera.view.PreviewViewimport androidx.compose.runtime.getValue
+import androidx.camera.view.PreviewView
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
@@ -212,7 +213,8 @@ class CameraController(private val activity: ComponentActivity) {
 
     // GPU stabilization + enhancement for Video mode (created when first needed).
     private var processor: VideoProcessor? = null
-    private var effect: VideoEffect? = null    private var boundBurst = false
+    private var effect: VideoEffect? = null
+    private var boundBurst = false
     private var deviceRotation = Surface.ROTATION_0
     private var lastUri: Uri? = null
 
