@@ -25,8 +25,9 @@ There's no Android SDK on the owner's PC, so builds run on GitHub: `gh workflow 
   - `process/BurstMerge.kt` — multi-frame pipeline (Night 8/16 / HDR / Clean selfies): sharpest frame as
     reference, coarse-to-fine global alignment (1/8 then 1/2 scale), then per-tile refinement (32 px tiles at 1/2
     scale = 64 px, ±3 search, parabola sub-pixel fit; flat or edge-of-search tiles keep the global offset; 3×3
-    median) with offsets interpolated between tile centres per pixel and frames sampled bilinearly (rounding to whole
-    pixels made the patch check reject edges → ragged outlines). Frames are compared by 3×3 patch averages (`patchDiff`: grain cancels, misalignment/motion
+    median) with offsets interpolated between tile centres per pixel, then touched up per strip at full resolution
+    (`refine`: each 64 px tile column's block re-matched on luma within ±2 px + parabola, plain blocks skipped, 3-wide
+    median; half-res offsets alone were ~0.5 px off → soft or dotted edges), and frames sampled bilinearly. Frames are compared by 3×3 patch averages (`patchDiff`: grain cancels, misalignment/motion
     doesn't); noise limits per brightness band (1.8 × median patch difference over 6 sample strips, never below
     `MergeParams.robust`, capped at 60); per-frame weights are softened with a 5×5 tent so pixels along edges don't
     flip between merged and reference-only (speckled outlines); robust per-pixel average in

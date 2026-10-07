@@ -34,7 +34,7 @@ data class MergeParams(
 ) {
     companion object {
         /** Low light: many frames averaged, then brightened. */
-        val NIGHT = MergeParams(robust = 20, targetMean = 0.40f, minGain = 1.0f, maxGain = 3.0f, saturation = 1.10f, sharpen = 0.35f)
+        val NIGHT = MergeParams(robust = 20, targetMean = 0.45f, minGain = 1.0f, maxGain = 3.0f, saturation = 1.10f, sharpen = 0.6f)
 
         /** Frames taken ~1 EV darker (highlights kept), averaged, then shadows lifted. */
         val HDR = MergeParams(robust = 16, targetMean = 0.45f, minGain = 1.3f, maxGain = 2.4f, saturation = 1.06f, sharpen = 0.25f)
@@ -69,8 +69,11 @@ object BurstMerge {
     /** How far a tile may move away from its frame's overall offset, in half-resolution pixels. */
     private const val TILE_RADIUS = 3
 
-    /** Extra frame rows a strip may need, because neighbouring tiles can be shifted by different amounts. */
-    private const val SLACK = 2 * (TILE_RADIUS + 2) * FINE
+    /** Full-resolution touch-up reach per strip and tile column, in pixels each way ([refine]). */
+    private const val REFINE = 2
+
+    /** Extra frame rows a strip may need: neighbouring tiles can be shifted differently, plus the touch-up reach. */
+    private const val SLACK = 2 * (TILE_RADIUS + 1) * FINE + 2 * (REFINE + 3)
 
     /** Brightness bands with their own noise limit. */
     private const val BANDS = 8
@@ -390,6 +393,13 @@ object BurstMerge {
         val weightTmp = FloatArray(width * STRIP)
         val rowDx = FloatArray(cols)
         val rowDy = FloatArray(cols)
+        val refLuma = IntArray(width * STRIP)
+        val frameLuma = IntArray(width * frameRows)
+        val rawX = FloatArray(cols)
+        val rawY = FloatArray(cols)
+        val corrX = FloatArray(cols)
+        val corrY = FloatArray(cols)
+        val sad = LongArray((2 * REFINE + 1) * (2 * REFINE + 1))
     }
 
     @Suppress("DEPRECATION")
@@ -412,13 +422,16 @@ object BurstMerge {
         return into
     }
 
-    private fun band(c: Int) = (((c shr 16 and 255) * 77 + (c shr 8 and 255) * 150 + (c and 255) * 29) shr 8) * BANDS shr 8
+    private fun luma(c: Int) = ((c shr 16 and 255) * 77 + (c shr 8 and 255) * 150 + (c and 255) * 29) shr 8
+
+    private fun band(c: Int) = luma(c) * BANDS shr 8
 
     /**
      * Fills [into] with the frame's pixels that line up with reference rows [y0] until [y1], or 0 where the frame
      * has none (decoded pixels are opaque, so never 0). Offsets are interpolated between tile centres, so the frame
-     * is gently warped rather than cut into blocks, and sampled between pixels (bilinear): rounding to whole pixels
-     * left edges up to half a pixel apart, which the merge then had to reject (ragged edges).
+     * is gently warped rather than cut into blocks, touched up at full resolution for this strip ([refine]), and
+     * sampled between pixels (bilinear): rounding to whole pixels left edges up to half a pixel apart, which the
+     * merge then had to reject (ragged edges).
      */
     private fun alignStrip(
         y0: Int,
@@ -428,6 +441,7 @@ object BurstMerge {
         m: Motion,
         grid: Grid,
         decoder: BitmapRegionDecoder,
+        refLuma: IntArray,
         buf: StripBuffers,
         into: IntArray,
     ) {
@@ -439,10 +453,15 @@ object BurstMerge {
             lo = min(lo, m.dy[k])
             hi = max(hi, m.dy[k])
         }
-        val fy0 = max(0, y0 + floor(lo).toInt() - 1)
-        val fy1 = min(height, min(y1 + ceil(hi).toInt() + 1, fy0 + buf.frameRows))
+        val fy0 = max(0, y0 + floor(lo).toInt() - REFINE - 2)
+        val fy1 = min(height, min(y1 + ceil(hi).toInt() + REFINE + 2, fy0 + buf.frameRows))
         if (fy1 <= fy0) return
         val px = decodeRegion(decoder, Rect(0, fy0, width, fy1), buf.frame)
+        val frameLuma = buf.frameLuma
+        for (i in 0 until (fy1 - fy0) * width) frameLuma[i] = luma(px[i])
+        refine(y0, y1, width, fy0, fy1, m, grid, refLuma, frameLuma, buf)
+        val corrX = buf.corrX
+        val corrY = buf.corrY
         val rowDx = buf.rowDx
         val rowDy = buf.rowDy
         for (y in y0 until y1) {
@@ -450,8 +469,8 @@ object BurstMerge {
             val tb = grid.y1[y] * cols
             val wy = grid.fy[y]
             for (c in 0 until cols) {
-                rowDx[c] = m.dx[ta + c] + (m.dx[tb + c] - m.dx[ta + c]) * wy
-                rowDy[c] = m.dy[ta + c] + (m.dy[tb + c] - m.dy[ta + c]) * wy
+                rowDx[c] = m.dx[ta + c] + (m.dx[tb + c] - m.dx[ta + c]) * wy + corrX[c]
+                rowDy[c] = m.dy[ta + c] + (m.dy[tb + c] - m.dy[ta + c]) * wy + corrY[c]
             }
             val base = (y - y0) * width
             for (x in 0 until width) {
@@ -480,6 +499,135 @@ object BurstMerge {
                 into[base + x] = (0xFF shl 24) or ((r + 0.5f).toInt() shl 16) or ((g + 0.5f).toInt() shl 8) or (b + 0.5f).toInt()
             }
         }
+    }
+
+    /**
+     * Full-resolution touch-up of the tile offsets for one strip. The half-resolution tile search can be about half a
+     * pixel off, which softened edges once 16 frames were averaged (or got them rejected: dotted outlines). Each tile
+     * column's block (64 px wide, the strip's height) is matched against the reference at whole-pixel steps around its
+     * current offset (following the best match up to [REFINE] px), then a parabola gives the sub-pixel position. Plain
+     * blocks keep their offset. The corrections (pixels, added to the tile offsets) go to [StripBuffers.corrX] /
+     * [StripBuffers.corrY] after a 3-wide median across columns.
+     */
+    private fun refine(
+        y0: Int,
+        y1: Int,
+        width: Int,
+        fy0: Int,
+        fy1: Int,
+        m: Motion,
+        grid: Grid,
+        refLuma: IntArray,
+        frameLuma: IntArray,
+        buf: StripBuffers,
+    ) {
+        val cols = m.cols
+        val ym = (y0 + y1 - 1) / 2
+        val ta = grid.y0[ym] * cols
+        val tb = grid.y1[ym] * cols
+        val wy = grid.fy[ym]
+        val span = TILE * FINE
+        val side = 2 * REFINE + 1
+        val sad = buf.sad
+        val rawX = buf.rawX
+        val rawY = buf.rawY
+        for (c in 0 until cols) {
+            rawX[c] = 0f
+            rawY[c] = 0f
+            val baseX = m.dx[ta + c] + (m.dx[tb + c] - m.dx[ta + c]) * wy
+            val baseY = m.dy[ta + c] + (m.dy[tb + c] - m.dy[ta + c]) * wy
+            val ix = (baseX + FLOOR + 0.5f).toInt() - BIAS
+            val iy = (baseY + FLOOR + 0.5f).toInt() - BIAS
+            val bx0 = c * span
+            val bx1 = if (c == cols - 1) width else min(width, bx0 + span)
+            Arrays.fill(sad, -1L)
+
+            fun score(ox: Int, oy: Int): Long {
+                if (ox < -REFINE || ox > REFINE || oy < -REFINE || oy > REFINE) return Long.MAX_VALUE
+                val k = (oy + REFINE) * side + (ox + REFINE)
+                if (sad[k] < 0) sad[k] = blockSad(refLuma, frameLuma, width, y0, y1, fy0, fy1, bx0, bx1, ix + ox, iy + oy)
+                return sad[k]
+            }
+
+            var cx = 0
+            var cy = 0
+            for (step in 0..REFINE) {
+                var best = Long.MAX_VALUE
+                var bx = cx
+                var by = cy
+                for (oy in cy - 1..cy + 1) {
+                    for (ox in cx - 1..cx + 1) {
+                        val v = score(ox, oy)
+                        if (v < best) {
+                            best = v
+                            bx = ox
+                            by = oy
+                        }
+                    }
+                }
+                if (best == Long.MAX_VALUE || (bx == cx && by == cy)) break
+                cx = bx
+                cy = by
+            }
+            val mid = score(cx, cy)
+            if (mid == Long.MAX_VALUE) continue
+            val left = score(cx - 1, cy)
+            val right = score(cx + 1, cy)
+            val up = score(cx, cy - 1)
+            val down = score(cx, cy + 1)
+            if (left == Long.MAX_VALUE || right == Long.MAX_VALUE || up == Long.MAX_VALUE || down == Long.MAX_VALUE) continue
+            // Plain block (every nearby offset matches about as well): keep the tile offset.
+            if (mid * 10 > (left + right + up + down) / 4 * 9) continue
+            rawX[c] = ix + cx + vertex(left, mid, right) - baseX
+            rawY[c] = iy + cy + vertex(up, mid, down) - baseY
+        }
+        val corrX = buf.corrX
+        val corrY = buf.corrY
+        for (c in 0 until cols) {
+            val a = max(0, c - 1)
+            val b = min(cols - 1, c + 1)
+            corrX[c] = median3(rawX[a], rawX[c], rawX[b])
+            corrY[c] = median3(rawY[a], rawY[c], rawY[b])
+        }
+    }
+
+    private fun median3(a: Float, b: Float, c: Float) = max(min(a, b), min(max(a, b), c))
+
+    /** Mean luma difference (× 1024) between a reference block and the frame shifted by (dx, dy); MAX if it barely overlaps. */
+    private fun blockSad(
+        refLuma: IntArray,
+        frameLuma: IntArray,
+        width: Int,
+        y0: Int,
+        y1: Int,
+        fy0: Int,
+        fy1: Int,
+        bx0: Int,
+        bx1: Int,
+        dx: Int,
+        dy: Int,
+    ): Long {
+        var sum = 0L
+        var n = 0
+        var y = y0
+        while (y < y1) {
+            val fy = y + dy
+            if (fy >= fy0 && fy < fy1) {
+                val rr = (y - y0) * width
+                val fr = (fy - fy0) * width + dx
+                var x = bx0
+                while (x < bx1) {
+                    val fx = x + dx
+                    if (fx >= 0 && fx < width) {
+                        sum += abs(refLuma[rr + x] - frameLuma[fr + x])
+                        n++
+                    }
+                    x += 2
+                }
+            }
+            y += 3
+        }
+        return if (n >= 256) sum * 1024 / n else Long.MAX_VALUE
     }
 
     /**
@@ -578,8 +726,9 @@ object BurstMerge {
             val y1 = min(height, y0 + sampleRows)
             if (y1 <= y0) continue
             val refPx = decodeRegion(decoders[ref]!!, Rect(0, y0, width, y1), buf.ref)
+            for (i in 0 until width * (y1 - y0)) buf.refLuma[i] = luma(refPx[i])
             for (k in others.take(2)) {
-                alignStrip(y0, y1, width, height, motions[k]!!, grid, decoders[k]!!, buf, buf.aligned)
+                alignStrip(y0, y1, width, height, motions[k]!!, grid, decoders[k]!!, buf.refLuma, buf, buf.aligned)
                 val diff = patchDiff(refPx, buf.aligned, width, y1 - y0, buf)
                 for (i in 0 until width * (y1 - y0)) {
                     if (buf.aligned[i] != 0) hist[band(refPx[i])][diff[i]]++
@@ -635,12 +784,13 @@ object BurstMerge {
             sb[i] = (c and 255).toFloat()
             sw[i] = 1f
             limit[i] = limits[band(c)]
+            buf.refLuma[i] = luma(c)
         }
 
         val frame = buf.aligned
         val weights = buf.weight
         for (k in others) {
-            alignStrip(y0, y1, width, height, motions[k]!!, grid, decoders[k]!!, buf, frame)
+            alignStrip(y0, y1, width, height, motions[k]!!, grid, decoders[k]!!, buf.refLuma, buf, frame)
             val diff = patchDiff(refPx, frame, width, h, buf)
             for (i in 0 until n) {
                 val d = diff[i]

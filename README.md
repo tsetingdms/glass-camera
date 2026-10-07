@@ -10,8 +10,9 @@ Everything happens on the phone: no internet permission, no account, no tracking
 - **Photo** — one shot from the camera's own processing. Optional **HDR**: 4 frames taken ~1 EV darker
   (bright skies keep their detail), aligned and merged, then the shadows are lifted.
 - **Night** — 8 or 16 frames (6 or 12 on the front camera) aligned for hand shake and averaged, which removes most
-  of the low-light grain, then brightened with local tone mapping. Alignment is per 64-pixel tile with sub-pixel
-  precision, so a slightly turning hand or small movements still line up; pixels that moved are left out (no ghosts).
+  of the low-light grain, then brightened with local tone mapping and sharpened. Alignment is per 64-pixel tile,
+  refined at full resolution to a fraction of a pixel, so a slightly turning hand or small movements still line up;
+  pixels that moved are left out (no ghosts).
 - **Natural detail** (Settings, on by default) — for Night the camera chip is asked to skip its own smoothing,
   which smears fine detail. Merging 8 or 16 frames removes the grain instead: frames are aligned to a fraction of a
   pixel, compared by 3×3 patches (grain averages out, a misaligned edge doesn't), and the merge measures how grainy
