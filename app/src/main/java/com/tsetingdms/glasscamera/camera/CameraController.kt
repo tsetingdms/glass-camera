@@ -288,7 +288,7 @@ class CameraController(private val activity: ComponentActivity) {
 
     // region Controls
 
-    fun setMode(value: Mode) {
+    fun selectMode(value: Mode) {
         if (busy || value == mode) return
         mode = value
         prefs.edit { putString("mode", value.name) }
@@ -334,23 +334,23 @@ class CameraController(private val activity: ComponentActivity) {
         prefs.edit { putBoolean("grid", grid) }
     }
 
-    fun setMirrorFront(on: Boolean) {
+    fun changeMirrorFront(on: Boolean) {
         mirrorFront = on
         prefs.edit { putBoolean("mirrorFront", on) }
     }
 
-    fun setCleanSelfies(on: Boolean) {
+    fun changeCleanSelfies(on: Boolean) {
         cleanSelfies = on
         prefs.edit { putBoolean("cleanSelfies", on) }
         rebindIfNeeded()
     }
 
-    fun setShutterSound(on: Boolean) {
+    fun changeShutterSound(on: Boolean) {
         shutterSound = on
         prefs.edit { putBoolean("shutterSound", on) }
     }
 
-    fun setZoom(value: Float) {
+    fun zoomTo(value: Float) {
         val cam = camera ?: return
         cam.cameraControl.setZoomRatio(value.coerceIn(minZoom, max(minZoom, maxZoom)))
     }
@@ -404,27 +404,27 @@ class CameraController(private val activity: ComponentActivity) {
 
     // region Pro
 
-    fun setProEv(value: Int) {
+    fun chooseEv(value: Int) {
         proEv = value
         applyPro()
     }
 
-    fun setProWb(value: Int) {
+    fun chooseWb(value: Int) {
         proWb = value
         applyPro()
     }
 
-    fun setProIso(value: Int?) {
+    fun chooseIso(value: Int?) {
         proIso = value
         applyPro()
     }
 
-    fun setProShutter(value: Long?) {
+    fun chooseShutter(value: Long?) {
         proShutter = value
         applyPro()
     }
 
-    fun setProFocus(value: Float?) {
+    fun chooseFocus(value: Float?) {
         proFocus = value
         applyPro()
     }

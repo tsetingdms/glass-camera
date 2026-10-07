@@ -192,7 +192,7 @@ private fun Viewfinder(c: CameraController, rotation: Float) {
                 }
                 .pointerInput(Unit) {
                     detectTransformGestures { _, _, zoomChange, _ ->
-                        if (zoomChange != 1f) c.setZoom(c.zoom * zoomChange)
+                        if (zoomChange != 1f) c.zoomTo(c.zoom * zoomChange)
                     }
                 },
         )
@@ -268,7 +268,7 @@ private fun ZoomChips(c: CameraController, rotation: Float, modifier: Modifier) 
             Box(
                 modifier = Modifier
                     .size(38.dp)
-                    .tiltPress("Zoom ${formatZoom(value)}", maxDegrees = 16f) { c.setZoom(value) }
+                    .tiltPress("Zoom ${formatZoom(value)}", maxDegrees = 16f) { c.zoomTo(value) }
                     .clip(CircleShape)
                     .background(if (selected) Color.White.copy(alpha = 0.92f) else Color.Transparent),
                 contentAlignment = Alignment.Center,
@@ -322,7 +322,7 @@ private fun ProPanel(c: CameraController, modifier: Modifier) {
                     } else {
                         val stride = maxOf(1, ((1f / 3f) / caps.evStep).roundToInt())
                         val steps = (caps.evRange.lower..caps.evRange.upper).filter { it % stride == 0 }
-                        steps.forEach { i -> Chip(evLabel(i, caps.evStep), selected = c.proEv == i) { c.setProEv(i) } }
+                        steps.forEach { i -> Chip(evLabel(i, caps.evStep), selected = c.proEv == i) { c.chooseEv(i) } }
                     }
                 }
                 ProSetting.WB -> {
@@ -334,17 +334,17 @@ private fun ProPanel(c: CameraController, modifier: Modifier) {
                         "Tungsten" to CaptureRequest.CONTROL_AWB_MODE_INCANDESCENT,
                         "Fluorescent" to CaptureRequest.CONTROL_AWB_MODE_FLUORESCENT,
                     ).filter { it.second == CaptureRequest.CONTROL_AWB_MODE_AUTO || it.second in caps.awbModes }
-                    all.forEach { (name, value) -> Chip(name, selected = c.proWb == value) { c.setProWb(value) } }
+                    all.forEach { (name, value) -> Chip(name, selected = c.proWb == value) { c.chooseWb(value) } }
                 }
                 ProSetting.ISO -> {
                     val range = caps.isoRange
                     if (!caps.manualSensor || range == null) {
                         Unavailable("ISO isn't adjustable on this camera (${caps.level})")
                     } else {
-                        Chip("Auto", selected = c.proIso == null) { c.setProIso(null) }
+                        Chip("Auto", selected = c.proIso == null) { c.chooseIso(null) }
                         listOf(50, 100, 200, 400, 800, 1600, 3200, 6400)
                             .filter { it in range.lower..range.upper }
-                            .forEach { iso -> Chip("$iso", selected = c.proIso == iso) { c.setProIso(iso) } }
+                            .forEach { iso -> Chip("$iso", selected = c.proIso == iso) { c.chooseIso(iso) } }
                     }
                 }
                 ProSetting.SHUTTER -> {
@@ -352,12 +352,12 @@ private fun ProPanel(c: CameraController, modifier: Modifier) {
                     if (!caps.manualSensor || range == null) {
                         Unavailable("Shutter speed isn't adjustable on this camera (${caps.level})")
                     } else {
-                        Chip("Auto", selected = c.proShutter == null) { c.setProShutter(null) }
+                        Chip("Auto", selected = c.proShutter == null) { c.chooseShutter(null) }
                         listOf(2000, 1000, 500, 250, 125, 60, 30, 15, 8, 4, 2)
                             .map { 1_000_000_000L / it }
                             .filter { it in range.lower..range.upper }
                             .forEach { ns ->
-                                Chip("1/${1_000_000_000L / ns}", selected = c.proShutter == ns) { c.setProShutter(ns) }
+                                Chip("1/${1_000_000_000L / ns}", selected = c.proShutter == ns) { c.chooseShutter(ns) }
                             }
                     }
                 }
@@ -365,10 +365,10 @@ private fun ProPanel(c: CameraController, modifier: Modifier) {
                     if (!caps.manualFocus) {
                         Unavailable(if (caps.minFocus == 0f) "This camera has fixed focus" else "Manual focus isn't available on this camera")
                     } else {
-                        Chip("Auto", selected = c.proFocus == null) { c.setProFocus(null) }
+                        Chip("Auto", selected = c.proFocus == null) { c.chooseFocus(null) }
                         listOf("∞" to 0f, "3 m" to 0.33f, "1 m" to 1f, "50 cm" to 2f, "25 cm" to 4f, "10 cm" to 10f)
                             .filter { it.second <= caps.minFocus }
-                            .forEach { (name, d) -> Chip(name, selected = c.proFocus == d) { c.setProFocus(d) } }
+                            .forEach { (name, d) -> Chip(name, selected = c.proFocus == d) { c.chooseFocus(d) } }
                     }
                 }
             }
@@ -396,7 +396,7 @@ private fun ModeSwitcher(c: CameraController) {
                 val selected = m == c.mode
                 Box(
                     modifier = Modifier
-                        .tiltPress(m.label, maxDegrees = 10f) { c.setMode(m) }
+                        .tiltPress(m.label, maxDegrees = 10f) { c.selectMode(m) }
                         .clip(RoundedCornerShape(50))
                         .background(if (selected) Color.White.copy(alpha = 0.92f) else Color.Transparent)
                         .padding(horizontal = 15.dp, vertical = 9.dp),
@@ -550,9 +550,9 @@ private fun SettingsSheet(c: CameraController) {
         ) {
             Label("Settings", size = 20.sp, weight = FontWeight.SemiBold)
             Spacer(Modifier.height(14.dp))
-            SettingRow("Mirror front photos", "Save selfies the way the viewfinder shows them", c.mirrorFront) { c.setMirrorFront(it) }
-            SettingRow("Clean selfies", "Front camera takes 4 quick shots and merges them for less grain", c.cleanSelfies) { c.setCleanSelfies(it) }
-            SettingRow("Shutter sound", null, c.shutterSound) { c.setShutterSound(it) }
+            SettingRow("Mirror front photos", "Save selfies the way the viewfinder shows them", c.mirrorFront) { c.changeMirrorFront(it) }
+            SettingRow("Clean selfies", "Front camera takes 4 quick shots and merges them for less grain", c.cleanSelfies) { c.changeCleanSelfies(it) }
+            SettingRow("Shutter sound", null, c.shutterSound) { c.changeShutterSound(it) }
             Spacer(Modifier.height(10.dp))
             val caps = c.caps
             if (caps != null) {
