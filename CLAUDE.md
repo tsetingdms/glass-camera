@@ -25,14 +25,17 @@ There's no Android SDK on the owner's PC, so builds run on GitHub: `gh workflow 
   - `process/BurstMerge.kt` — multi-frame pipeline (Night 8/16 / HDR / Clean selfies): sharpest frame as
     reference, coarse-to-fine global alignment (1/8 then 1/2 scale), then per-tile refinement (32 px tiles at 1/2
     scale = 64 px, ±3 search, parabola sub-pixel fit; flat or edge-of-search tiles keep the global offset; 3×3
-    median) with offsets interpolated between tile centres per pixel. Frames are compared by 3×3 patch averages (`patchDiff`: grain cancels, misalignment/motion
+    median) with offsets interpolated between tile centres per pixel and frames sampled bilinearly (rounding to whole
+    pixels made the patch check reject edges → ragged outlines). Frames are compared by 3×3 patch averages (`patchDiff`: grain cancels, misalignment/motion
     doesn't); noise limits per brightness band (1.8 × median patch difference over 6 sample strips, never below
-    `MergeParams.robust`, capped at 60), robust per-pixel average in
+    `MergeParams.robust`, capped at 60); per-frame weights are softened with a 5×5 tent so pixels along edges don't
+    flip between merged and reference-only (speckled outlines); robust per-pixel average in
     96-row strips decoded with `BitmapRegionDecoder` (memory ≈ one picture), then local tone mapping (blurred 1/32
     luminance → gain map) with a light unsharp mask and saturation. `MergeParams.NIGHT/HDR/CLEAN` hold the tuning;
     `merge` returns `Merged` (bitmap + frames used).
-  - Natural detail: `CameraController.chipProcessing` sets NOISE_REDUCTION_MODE (MINIMAL, else OFF; the E40 only
-    has OFF) through `Camera2CameraControl` only for the burst, then clears the options (bursts never run in Pro).
+  - Natural detail (Night only — 4-frame HDR/Clean came out ~50 % grainier without chip smoothing on the E40):
+    `CameraController.chipProcessing` sets NOISE_REDUCTION_MODE (MINIMAL, else OFF; the E40 only has OFF) through
+    `Camera2CameraControl` only for the burst, then clears the options (bursts never run in Pro).
     Chip sharpening (EDGE_MODE) stays on: switching it off made E40 photos ~15 % softer. Support = `Caps.rawNoise`.
   - `process/Portrait.kt` — ML Kit selfie segmentation on a 512 px upright copy, mask mapped back to the stored
     orientation, background blurred at 1/8 with weights excluding the person (no halo), feathered composite.

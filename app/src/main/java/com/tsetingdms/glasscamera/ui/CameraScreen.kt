@@ -669,7 +669,7 @@ private fun SettingsSheet(c: CameraController) {
                 if (caps != null && !caps.detailControl) {
                     "This camera doesn't let apps switch off its smoothing"
                 } else {
-                    "Night, HDR and Clean selfies skip the camera's smoothing — merging removes the grain and keeps fine detail"
+                    "Night photos skip the camera's smoothing — merging 8 or 16 frames removes the grain and keeps fine detail"
                 },
                 c.naturalDetail,
             ) { c.changeNaturalDetail(it) }

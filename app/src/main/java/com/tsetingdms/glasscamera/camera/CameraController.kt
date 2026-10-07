@@ -107,7 +107,7 @@ class Caps(
 ) {
     val manualFocus get() = manualSensor && minFocus > 0f
 
-    /** Merged shots can skip the chip's smoothing ("Natural detail"). */
+    /** Night shots can skip the chip's smoothing ("Natural detail"). */
     val detailControl get() = rawNoise != null
 }
 
@@ -155,7 +155,7 @@ class CameraController(private val activity: ComponentActivity) {
     var night16 by mutableStateOf(prefs.getBoolean("night16", false))
         private set
 
-    /** Merged shots ask the chip for unsmoothed frames; the merge removes the grain instead. */
+    /** Night asks the chip for unsmoothed frames; merging 8–16 of them removes the grain instead. */
     var naturalDetail by mutableStateOf(prefs.getBoolean("naturalDetail", true))
         private set
 
@@ -762,7 +762,9 @@ class CameraController(private val activity: ComponentActivity) {
             0
         }
         if (ev != 0) runCatching { cam.cameraControl.setExposureCompensationIndex(ev).awaitResult() }
-        val natural = naturalDetail && c != null && c.detailControl &&
+        // Only Night: its 8–16 frames cut the grain to a third or a quarter, enough to replace the chip's smoothing.
+        // HDR and Clean selfies merge 4 frames (grain halved), which left E40 photos ~50 % grainier without it.
+        val natural = kind == Burst.NIGHT && naturalDetail && c != null && c.detailControl &&
             runCatching { chipProcessing(cam, natural = true) }.isSuccess
         if (ev != 0 || natural) delay(if (ev != 0) 500 else 250)
 
@@ -794,7 +796,7 @@ class CameraController(private val activity: ComponentActivity) {
     }
 
     /**
-     * Natural detail: asks the chip to skip its noise smoothing for the burst (the merge averages the grain away and
+     * Natural detail: asks the chip to skip its noise smoothing for a Night burst (the merge averages the grain away and
      * keeps the fine detail the smoothing would smear), or returns it to normal. The chip's sharpening stays on: with
      * it off, photos came out softer on the E40. Never used in Pro mode, whose own capture options would be cleared.
      */

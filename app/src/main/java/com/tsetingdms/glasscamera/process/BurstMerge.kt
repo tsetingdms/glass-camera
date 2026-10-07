@@ -34,13 +34,13 @@ data class MergeParams(
 ) {
     companion object {
         /** Low light: many frames averaged, then brightened. */
-        val NIGHT = MergeParams(robust = 18, targetMean = 0.40f, minGain = 1.0f, maxGain = 3.0f, saturation = 1.10f, sharpen = 0.35f)
+        val NIGHT = MergeParams(robust = 20, targetMean = 0.40f, minGain = 1.0f, maxGain = 3.0f, saturation = 1.10f, sharpen = 0.35f)
 
         /** Frames taken ~1 EV darker (highlights kept), averaged, then shadows lifted. */
-        val HDR = MergeParams(robust = 14, targetMean = 0.45f, minGain = 1.3f, maxGain = 2.4f, saturation = 1.06f, sharpen = 0.25f)
+        val HDR = MergeParams(robust = 16, targetMean = 0.45f, minGain = 1.3f, maxGain = 2.4f, saturation = 1.06f, sharpen = 0.25f)
 
         /** Front camera: a few frames averaged to remove the small sensor's grain. */
-        val CLEAN = MergeParams(robust = 14, targetMean = 0.42f, minGain = 1.0f, maxGain = 1.35f, saturation = 1.04f, sharpen = 0.22f)
+        val CLEAN = MergeParams(robust = 16, targetMean = 0.42f, minGain = 1.0f, maxGain = 1.35f, saturation = 1.04f, sharpen = 0.22f)
     }
 }
 
@@ -75,8 +75,8 @@ object BurstMerge {
     /** Brightness bands with their own noise limit. */
     private const val BANDS = 8
 
-    /** Rounds offsets with a cheap cast (valid for values above −1024). */
-    private const val ROUND = 1024.5f
+    /** Floors sample positions with a cheap cast (valid for values above −1024). */
+    private const val FLOOR = 1024f
     private const val BIAS = 1024
 
     private class Gray(val w: Int, val h: Int, val px: IntArray)
@@ -386,6 +386,8 @@ object BurstMerge {
         val g = FloatArray(width * STRIP)
         val b = FloatArray(width * STRIP)
         val w = FloatArray(width * STRIP)
+        val weight = FloatArray(width * STRIP)
+        val weightTmp = FloatArray(width * STRIP)
         val rowDx = FloatArray(cols)
         val rowDy = FloatArray(cols)
     }
@@ -415,7 +417,8 @@ object BurstMerge {
     /**
      * Fills [into] with the frame's pixels that line up with reference rows [y0] until [y1], or 0 where the frame
      * has none (decoded pixels are opaque, so never 0). Offsets are interpolated between tile centres, so the frame
-     * is gently warped rather than cut into blocks.
+     * is gently warped rather than cut into blocks, and sampled between pixels (bilinear): rounding to whole pixels
+     * left edges up to half a pixel apart, which the merge then had to reject (ragged edges).
      */
     private fun alignStrip(
         y0: Int,
@@ -455,10 +458,26 @@ object BurstMerge {
                 val ca = grid.x0[x]
                 val cb = grid.x1[x]
                 val wx = grid.fx[x]
-                val fx = x + (rowDx[ca] + (rowDx[cb] - rowDx[ca]) * wx + ROUND).toInt() - BIAS
-                val fy = y + (rowDy[ca] + (rowDy[cb] - rowDy[ca]) * wx + ROUND).toInt() - BIAS
-                if (fx < 0 || fx >= width || fy < fy0 || fy >= fy1) continue
-                into[base + x] = px[(fy - fy0) * width + fx]
+                val sx = x + rowDx[ca] + (rowDx[cb] - rowDx[ca]) * wx
+                val sy = y + rowDy[ca] + (rowDy[cb] - rowDy[ca]) * wx
+                val ix = (sx + FLOOR).toInt() - BIAS
+                val iy = (sy + FLOOR).toInt() - BIAS
+                if (ix < 0 || ix + 1 >= width || iy < fy0 || iy + 1 >= fy1) continue
+                val ax = sx - ix
+                val ay = sy - iy
+                val i00 = (iy - fy0) * width + ix
+                val p00 = px[i00]
+                val p10 = px[i00 + 1]
+                val p01 = px[i00 + width]
+                val p11 = px[i00 + width + 1]
+                val w11 = ax * ay
+                val w10 = ax - w11
+                val w01 = ay - w11
+                val w00 = 1f - ax - ay + w11
+                val r = (p00 shr 16 and 255) * w00 + (p10 shr 16 and 255) * w10 + (p01 shr 16 and 255) * w01 + (p11 shr 16 and 255) * w11
+                val g = (p00 shr 8 and 255) * w00 + (p10 shr 8 and 255) * w10 + (p01 shr 8 and 255) * w01 + (p11 shr 8 and 255) * w11
+                val b = (p00 and 255) * w00 + (p10 and 255) * w10 + (p01 and 255) * w01 + (p11 and 255) * w11
+                into[base + x] = (0xFF shl 24) or ((r + 0.5f).toInt() shl 16) or ((g + 0.5f).toInt() shl 8) or (b + 0.5f).toInt()
             }
         }
     }
@@ -493,6 +512,26 @@ object BurstMerge {
         val d = buf.diff
         for (i in 0 until n) d[i] = (abs(dr[i]) + abs(dg[i]) + abs(db[i])) / 9
         return d
+    }
+
+    /** Two in-place 3×3 box averages (a 5×5 tent) over a strip, the outermost pixels repeating at the edges. */
+    private fun soften(a: FloatArray, width: Int, h: Int, tmp: FloatArray) {
+        repeat(2) {
+            for (y in 0 until h) {
+                val row = y * width
+                for (x in 0 until width) {
+                    val l = if (x > 0) a[row + x - 1] else a[row + x]
+                    val r = if (x < width - 1) a[row + x + 1] else a[row + x]
+                    tmp[row + x] = (l + a[row + x] + r) * (1f / 3f)
+                }
+            }
+            for (y in 0 until h) {
+                val row = y * width
+                val up = if (y > 0) row - width else row
+                val down = if (y < h - 1) row + width else row
+                for (x in 0 until width) a[row + x] = (tmp[up + x] + tmp[row + x] + tmp[down + x]) * (1f / 3f)
+            }
+        }
     }
 
     /** In-place 3×3 box sum over a strip (the outermost pixels repeat at the edges). */
@@ -599,20 +638,26 @@ object BurstMerge {
         }
 
         val frame = buf.aligned
+        val weights = buf.weight
         for (k in others) {
             alignStrip(y0, y1, width, height, motions[k]!!, grid, decoders[k]!!, buf, frame)
             val diff = patchDiff(refPx, frame, width, h, buf)
             for (i in 0 until n) {
-                val c = frame[i]
-                if (c == 0) continue
                 val d = diff[i]
                 val t = limit[i]
-                val weight = when {
+                weights[i] = when {
+                    frame[i] == 0 || d >= 2 * t -> 0f
                     d <= t -> 1f
-                    d >= 2 * t -> 0f
                     else -> (2 * t - d).toFloat() / t
                 }
-                if (weight > 0f) {
+            }
+            // Spread each decision over its neighbours, so pixels along an edge don't flip one by one between
+            // "averaged" and "reference only" (that left speckled, ragged outlines).
+            soften(weights, width, h, buf.weightTmp)
+            for (i in 0 until n) {
+                val c = frame[i]
+                val weight = weights[i]
+                if (c != 0 && weight > 0.01f) {
                     sr[i] += (c shr 16 and 255) * weight
                     sg[i] += (c shr 8 and 255) * weight
                     sb[i] += (c and 255) * weight

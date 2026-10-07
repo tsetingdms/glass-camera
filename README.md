@@ -12,10 +12,11 @@ Everything happens on the phone: no internet permission, no account, no tracking
 - **Night** — 8 or 16 frames (6 or 12 on the front camera) aligned for hand shake and averaged, which removes most
   of the low-light grain, then brightened with local tone mapping. Alignment is per 64-pixel tile with sub-pixel
   precision, so a slightly turning hand or small movements still line up; pixels that moved are left out (no ghosts).
-- **Natural detail** (Settings, on by default) — for Night, HDR and Clean selfies the camera chip is asked to skip
-  its own smoothing, which smears fine detail. The merge removes the grain instead: it compares 3×3 patches (grain
-  averages out, a misaligned edge doesn't), measures how grainy the frames are and averages accordingly.
-  Settings → This camera shows whether the phone allows it.
+- **Natural detail** (Settings, on by default) — for Night the camera chip is asked to skip its own smoothing,
+  which smears fine detail. Merging 8 or 16 frames removes the grain instead: frames are aligned to a fraction of a
+  pixel, compared by 3×3 patches (grain averages out, a misaligned edge doesn't), and the merge measures how grainy
+  they are. HDR and Clean selfies (4 frames) keep the chip's smoothing. Settings → This camera shows whether the
+  phone allows it.
 - **Portrait** — on-device person detection (ML Kit, offline) and a soft background blur.
 - **Video** — 1080p (or 720p) at a high bitrate, with sound. **Stable**: GCam-style software stabilization — each
   frame's hand shake is measured against the previous one and cancelled within a 15 % crop. **Enhance**: local tone
