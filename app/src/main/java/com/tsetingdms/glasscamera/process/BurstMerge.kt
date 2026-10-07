@@ -9,6 +9,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import java.util.Arrays
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 import kotlin.math.ceil
@@ -20,8 +21,8 @@ import kotlin.math.roundToInt
 /** Tuning for one multi-frame mode. */
 data class MergeParams(
     /**
-     * Smallest sum of the R+G+B differences (0..765) still treated as noise; above about twice the limit a frame is
-     * ignored there. The real limit is measured from the frames and only ever raised above this.
+     * Smallest R+G+B difference of 3×3 patch averages (0..765) still treated as noise; above about twice the limit a
+     * frame is ignored there. The real limit is measured from the frames and only ever raised above this.
      */
     val robust: Int,
     /** Average brightness (0..1) the picture is lifted towards. */
@@ -33,13 +34,13 @@ data class MergeParams(
 ) {
     companion object {
         /** Low light: many frames averaged, then brightened. */
-        val NIGHT = MergeParams(robust = 54, targetMean = 0.40f, minGain = 1.0f, maxGain = 3.0f, saturation = 1.10f, sharpen = 0.35f)
+        val NIGHT = MergeParams(robust = 18, targetMean = 0.40f, minGain = 1.0f, maxGain = 3.0f, saturation = 1.10f, sharpen = 0.35f)
 
         /** Frames taken ~1 EV darker (highlights kept), averaged, then shadows lifted. */
-        val HDR = MergeParams(robust = 42, targetMean = 0.45f, minGain = 1.3f, maxGain = 2.4f, saturation = 1.06f, sharpen = 0.25f)
+        val HDR = MergeParams(robust = 14, targetMean = 0.45f, minGain = 1.3f, maxGain = 2.4f, saturation = 1.06f, sharpen = 0.25f)
 
         /** Front camera: a few frames averaged to remove the small sensor's grain. */
-        val CLEAN = MergeParams(robust = 42, targetMean = 0.42f, minGain = 1.0f, maxGain = 1.35f, saturation = 1.04f, sharpen = 0.22f)
+        val CLEAN = MergeParams(robust = 14, targetMean = 0.42f, minGain = 1.0f, maxGain = 1.35f, saturation = 1.04f, sharpen = 0.22f)
     }
 }
 
@@ -374,8 +375,13 @@ object BurstMerge {
         val frameRows = STRIP + SLACK
         val ref = IntArray(width * STRIP)
         val frame = IntArray(width * frameRows)
-        val out = IntArray(width * STRIP)
+        val aligned = IntArray(width * STRIP)
         val limit = IntArray(width * STRIP)
+        val dr = IntArray(width * STRIP)
+        val dg = IntArray(width * STRIP)
+        val db = IntArray(width * STRIP)
+        val tmp = IntArray(width * STRIP)
+        val diff = IntArray(width * STRIP)
         val r = FloatArray(width * STRIP)
         val g = FloatArray(width * STRIP)
         val b = FloatArray(width * STRIP)
@@ -404,14 +410,14 @@ object BurstMerge {
         return into
     }
 
-    private fun band(r: Int, g: Int, b: Int) = ((r * 77 + g * 150 + b * 29) shr 8) * BANDS shr 8
+    private fun band(c: Int) = (((c shr 16 and 255) * 77 + (c shr 8 and 255) * 150 + (c and 255) * 29) shr 8) * BANDS shr 8
 
     /**
-     * Decodes the part of a frame that lines up with reference rows [y0] until [y1] and calls [action] with each
-     * reference pixel's index in the strip and the frame's matching colour. Offsets are interpolated between tile
-     * centres, so the frame is gently warped rather than cut into blocks.
+     * Fills [into] with the frame's pixels that line up with reference rows [y0] until [y1], or 0 where the frame
+     * has none (decoded pixels are opaque, so never 0). Offsets are interpolated between tile centres, so the frame
+     * is gently warped rather than cut into blocks.
      */
-    private inline fun eachAligned(
+    private fun alignStrip(
         y0: Int,
         y1: Int,
         width: Int,
@@ -420,8 +426,9 @@ object BurstMerge {
         grid: Grid,
         decoder: BitmapRegionDecoder,
         buf: StripBuffers,
-        action: (i: Int, color: Int) -> Unit,
+        into: IntArray,
     ) {
+        Arrays.fill(into, 0, (y1 - y0) * width, 0)
         val cols = m.cols
         var lo = Float.MAX_VALUE
         var hi = -Float.MAX_VALUE
@@ -451,13 +458,63 @@ object BurstMerge {
                 val fx = x + (rowDx[ca] + (rowDx[cb] - rowDx[ca]) * wx + ROUND).toInt() - BIAS
                 val fy = y + (rowDy[ca] + (rowDy[cb] - rowDy[ca]) * wx + ROUND).toInt() - BIAS
                 if (fx < 0 || fx >= width || fy < fy0 || fy >= fy1) continue
-                action(base + x, px[(fy - fy0) * width + fx])
+                into[base + x] = px[(fy - fy0) * width + fx]
             }
         }
     }
 
     /**
-     * How different an aligned pixel may be and still count as noise, per brightness band: 1.7 × the median
+     * For each strip pixel, how much the aligned frame differs from the reference once both are averaged over 3×3
+     * pixels (sum of the R, G and B differences, 0..765). Averaging cancels most of the grain but not a real
+     * difference, such as an edge that doesn't quite line up or something that moved, so even very grainy frames
+     * (camera smoothing off) can be told apart from misalignment.
+     */
+    private fun patchDiff(ref: IntArray, frame: IntArray, width: Int, h: Int, buf: StripBuffers): IntArray {
+        val n = width * h
+        val dr = buf.dr
+        val dg = buf.dg
+        val db = buf.db
+        for (i in 0 until n) {
+            val c = frame[i]
+            if (c == 0) {
+                dr[i] = 0
+                dg[i] = 0
+                db[i] = 0
+            } else {
+                val r0 = ref[i]
+                dr[i] = (c shr 16 and 255) - (r0 shr 16 and 255)
+                dg[i] = (c shr 8 and 255) - (r0 shr 8 and 255)
+                db[i] = (c and 255) - (r0 and 255)
+            }
+        }
+        box3(dr, width, h, buf.tmp)
+        box3(dg, width, h, buf.tmp)
+        box3(db, width, h, buf.tmp)
+        val d = buf.diff
+        for (i in 0 until n) d[i] = (abs(dr[i]) + abs(dg[i]) + abs(db[i])) / 9
+        return d
+    }
+
+    /** In-place 3×3 box sum over a strip (the outermost pixels repeat at the edges). */
+    private fun box3(a: IntArray, width: Int, h: Int, tmp: IntArray) {
+        for (y in 0 until h) {
+            val row = y * width
+            for (x in 0 until width) {
+                val l = if (x > 0) a[row + x - 1] else a[row + x]
+                val r = if (x < width - 1) a[row + x + 1] else a[row + x]
+                tmp[row + x] = l + a[row + x] + r
+            }
+        }
+        for (y in 0 until h) {
+            val row = y * width
+            val up = if (y > 0) row - width else row
+            val down = if (y < h - 1) row + width else row
+            for (x in 0 until width) a[row + x] = tmp[up + x] + tmp[row + x] + tmp[down + x]
+        }
+    }
+
+    /**
+     * How different an aligned patch may be and still count as noise, per brightness band: 1.8 × the median patch
      * difference between the reference and up to two other frames over six sample strips. Frames without the
      * camera's own smoothing are grainier, so the limit rises with them; it never drops below the mode's value.
      */
@@ -483,13 +540,10 @@ object BurstMerge {
             if (y1 <= y0) continue
             val refPx = decodeRegion(decoders[ref]!!, Rect(0, y0, width, y1), buf.ref)
             for (k in others.take(2)) {
-                eachAligned(y0, y1, width, height, motions[k]!!, grid, decoders[k]!!, buf) { i, c ->
-                    val r0 = refPx[i]
-                    val rr = r0 shr 16 and 255
-                    val gg = r0 shr 8 and 255
-                    val bb = r0 and 255
-                    val d = abs((c shr 16 and 255) - rr) + abs((c shr 8 and 255) - gg) + abs((c and 255) - bb)
-                    hist[band(rr, gg, bb)][d]++
+                alignStrip(y0, y1, width, height, motions[k]!!, grid, decoders[k]!!, buf, buf.aligned)
+                val diff = patchDiff(refPx, buf.aligned, width, y1 - y0, buf)
+                for (i in 0 until width * (y1 - y0)) {
+                    if (buf.aligned[i] != 0) hist[band(refPx[i])][diff[i]]++
                 }
             }
         }
@@ -498,7 +552,7 @@ object BurstMerge {
         val overall = median(all) ?: return fallback
         return IntArray(BANDS) { b ->
             val med = if (hist[b].sum() >= 4000) median(hist[b]) ?: overall else overall
-            max(p.robust, min(150, (med * 1.7f).roundToInt()))
+            max(p.robust, min(60, (med * 1.8f).roundToInt()))
         }
     }
 
@@ -537,23 +591,21 @@ object BurstMerge {
         val limit = buf.limit
         for (i in 0 until n) {
             val c = refPx[i]
-            val r = c shr 16 and 255
-            val g = c shr 8 and 255
-            val b = c and 255
-            sr[i] = r.toFloat()
-            sg[i] = g.toFloat()
-            sb[i] = b.toFloat()
+            sr[i] = (c shr 16 and 255).toFloat()
+            sg[i] = (c shr 8 and 255).toFloat()
+            sb[i] = (c and 255).toFloat()
             sw[i] = 1f
-            limit[i] = limits[band(r, g, b)]
+            limit[i] = limits[band(c)]
         }
 
+        val frame = buf.aligned
         for (k in others) {
-            eachAligned(y0, y1, width, height, motions[k]!!, grid, decoders[k]!!, buf) { i, c ->
-                val r0 = refPx[i]
-                val cr = c shr 16 and 255
-                val cg = c shr 8 and 255
-                val cb = c and 255
-                val d = abs(cr - (r0 shr 16 and 255)) + abs(cg - (r0 shr 8 and 255)) + abs(cb - (r0 and 255))
+            alignStrip(y0, y1, width, height, motions[k]!!, grid, decoders[k]!!, buf, frame)
+            val diff = patchDiff(refPx, frame, width, h, buf)
+            for (i in 0 until n) {
+                val c = frame[i]
+                if (c == 0) continue
+                val d = diff[i]
                 val t = limit[i]
                 val weight = when {
                     d <= t -> 1f
@@ -561,15 +613,16 @@ object BurstMerge {
                     else -> (2 * t - d).toFloat() / t
                 }
                 if (weight > 0f) {
-                    sr[i] += cr * weight
-                    sg[i] += cg * weight
-                    sb[i] += cb * weight
+                    sr[i] += (c shr 16 and 255) * weight
+                    sg[i] += (c shr 8 and 255) * weight
+                    sb[i] += (c and 255) * weight
                     sw[i] += weight
                 }
             }
         }
 
-        val o = buf.out
+        // The reference pixels aren't needed any more: reuse their buffer for the result.
+        val o = buf.ref
         for (i in 0 until n) {
             val w = sw[i]
             val r = (sr[i] / w).roundToInt().coerceIn(0, 255)

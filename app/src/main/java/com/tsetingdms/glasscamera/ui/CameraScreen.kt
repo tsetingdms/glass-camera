@@ -669,7 +669,7 @@ private fun SettingsSheet(c: CameraController) {
                 if (caps != null && !caps.detailControl) {
                     "This camera doesn't let apps switch off its smoothing"
                 } else {
-                    "Night, HDR and Clean selfies skip the camera's smoothing and sharpening — merging removes the grain and keeps fine detail"
+                    "Night, HDR and Clean selfies skip the camera's smoothing — merging removes the grain and keeps fine detail"
                 },
                 c.naturalDetail,
             ) { c.changeNaturalDetail(it) }
@@ -685,7 +685,7 @@ private fun SettingsSheet(c: CameraController) {
                 Label(
                     "Camera2 level: ${caps.level} · Manual ISO/shutter: ${if (caps.manualSensor) "yes" else "no"} · " +
                         "Focus: ${if (caps.minFocus > 0f) "auto" else "fixed"} · Flash: ${if (caps.hasFlash) "yes" else "no"} · " +
-                        "Smoothing: $smoothing · Sharpening: ${if (caps.edgeOff) "can switch off" else "fixed"}",
+                        "Smoothing control: $smoothing",
                     color = Color.White.copy(alpha = 0.85f),
                     size = 12.sp,
                 )

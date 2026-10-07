@@ -104,13 +104,11 @@ class Caps(
     val hasFlash: Boolean,
     /** Lightest noise reduction apps may ask the chip for (MINIMAL, else OFF); null = only its own smoothing. */
     val rawNoise: Int?,
-    /** The chip's sharpening can be switched off. */
-    val edgeOff: Boolean,
 ) {
     val manualFocus get() = manualSensor && minFocus > 0f
 
-    /** Merged shots can skip some of the chip's processing ("Natural detail"). */
-    val detailControl get() = rawNoise != null || edgeOff
+    /** Merged shots can skip the chip's smoothing ("Natural detail"). */
+    val detailControl get() = rawNoise != null
 }
 
 private class Shot(val jpeg: ByteArray, val rotation: Int)
@@ -157,7 +155,7 @@ class CameraController(private val activity: ComponentActivity) {
     var night16 by mutableStateOf(prefs.getBoolean("night16", false))
         private set
 
-    /** Merged shots ask the chip for unsmoothed, unsharpened frames; the merge removes the grain instead. */
+    /** Merged shots ask the chip for unsmoothed frames; the merge removes the grain instead. */
     var naturalDetail by mutableStateOf(prefs.getBoolean("naturalDetail", true))
         private set
 
@@ -375,7 +373,6 @@ class CameraController(private val activity: ComponentActivity) {
         }
         val capabilities = info.getCameraCharacteristic(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: IntArray(0)
         val noiseModes = info.getCameraCharacteristic(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES) ?: IntArray(0)
-        val edgeModes = info.getCameraCharacteristic(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES) ?: IntArray(0)
         val exposure = cam.cameraInfo.exposureState
         return Caps(
             level = level,
@@ -394,7 +391,6 @@ class CameraController(private val activity: ComponentActivity) {
                 CameraMetadata.NOISE_REDUCTION_MODE_OFF in noiseModes -> CameraMetadata.NOISE_REDUCTION_MODE_OFF
                 else -> null
             },
-            edgeOff = CameraMetadata.EDGE_MODE_OFF in edgeModes,
         )
     }
 
@@ -786,10 +782,8 @@ class CameraController(private val activity: ComponentActivity) {
         val rotation = shots.first().rotation
         val jpegs = shots.map { it.jpeg }
         shots.clear()
-        // Without the chip's sharpening the merge sharpens a little more itself.
-        val params = if (natural && c?.edgeOff == true) kind.params.copy(sharpen = kind.params.sharpen * 1.5f) else kind.params
         val merged = withContext(Dispatchers.Default) {
-            BurstMerge.merge(jpegs, params) { f -> post { status = Status("Processing…", 0.5f + 0.5f * f) } }
+            BurstMerge.merge(jpegs, kind.params) { f -> post { status = Status("Processing…", 0.5f + 0.5f * f) } }
         }
         try {
             saved(ImageSaver.saveBitmap(activity, merged.bitmap, rotation, mirror))
@@ -800,9 +794,9 @@ class CameraController(private val activity: ComponentActivity) {
     }
 
     /**
-     * Natural detail: asks the chip to skip its noise smoothing and sharpening for the burst (the merge averages the
-     * grain away and keeps the fine detail the smoothing would smear), or returns it to normal. Never used in Pro
-     * mode, whose own capture options would be cleared.
+     * Natural detail: asks the chip to skip its noise smoothing for the burst (the merge averages the grain away and
+     * keeps the fine detail the smoothing would smear), or returns it to normal. The chip's sharpening stays on: with
+     * it off, photos came out softer on the E40. Never used in Pro mode, whose own capture options would be cleared.
      */
     @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
     private suspend fun chipProcessing(cam: Camera, natural: Boolean) {
@@ -812,9 +806,8 @@ class CameraController(private val activity: ComponentActivity) {
             control.clearCaptureRequestOptions().awaitResult()
             return
         }
-        val options = CaptureRequestOptions.Builder()
-        c.rawNoise?.let { options.setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, it) }
-        if (c.edgeOff) options.setCaptureRequestOption(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_OFF)
+        val noise = c.rawNoise ?: return
+        val options = CaptureRequestOptions.Builder().setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, noise)
         control.setCaptureRequestOptions(options.build()).awaitResult()
     }
 
