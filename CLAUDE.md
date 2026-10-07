@@ -22,10 +22,17 @@ There's no Android SDK on the owner's PC, so builds run on GitHub: `gh workflow 
   - `camera/CameraController.kt` — CameraX binding (Preview + ImageCapture, 4:3, capture ≤ 13 MP), Compose state for
     the UI, settings in SharedPreferences `glass_camera`, capture flows, Pro controls via Camera2 interop
     (`Camera2CameraControl` capture-request options), capability read-out (`Caps`).
-  - `process/BurstMerge.kt` — multi-frame pipeline (Night / HDR / Clean selfies): sharpest frame as reference,
-    coarse-to-fine global alignment (1/8 then 1/2 scale), robust per-pixel average in 96-row strips decoded with
-    `BitmapRegionDecoder` (memory ≈ one picture), then local tone mapping (blurred 1/32 luminance → gain map) with a
-    light unsharp mask and saturation. `MergeParams.NIGHT/HDR/CLEAN` hold the tuning.
+  - `process/BurstMerge.kt` — multi-frame pipeline (Night 8/16 / HDR / Clean selfies): sharpest frame as
+    reference, coarse-to-fine global alignment (1/8 then 1/2 scale), then per-tile refinement (32 px tiles at 1/2
+    scale = 64 px, ±3 search, parabola sub-pixel fit; flat or edge-of-search tiles keep the global offset; 3×3
+    median) with offsets interpolated between tile centres per pixel. Noise limits per brightness band (1.7 × median
+    reference/frame difference over 6 sample strips, never below `MergeParams.robust`), robust per-pixel average in
+    96-row strips decoded with `BitmapRegionDecoder` (memory ≈ one picture), then local tone mapping (blurred 1/32
+    luminance → gain map) with a light unsharp mask and saturation. `MergeParams.NIGHT/HDR/CLEAN` hold the tuning;
+    `merge` returns `Merged` (bitmap + frames used).
+  - Natural detail: `CameraController.chipProcessing` sets NOISE_REDUCTION_MODE (MINIMAL, else OFF) and EDGE_MODE
+    OFF through `Camera2CameraControl` only for the burst, then clears the options (bursts never run in Pro). Support
+    comes from `Caps.rawNoise` / `Caps.edgeOff`; without chip sharpening the merge sharpens 1.5×.
   - `process/Portrait.kt` — ML Kit selfie segmentation on a 512 px upright copy, mask mapped back to the stored
     orientation, background blurred at 1/8 with weights excluding the person (no halo), feathered composite.
   - `process/ImageSaver.kt` — MediaStore (DCIM/Glass Camera, no storage permission; `IS_PENDING`), EXIF orientation

@@ -220,6 +220,14 @@ private fun Viewfinder(c: CameraController, rotation: Float) {
                 Spacer(Modifier.height(10.dp))
                 ZoomChips(c, rotation, Modifier)
             }
+            Mode.NIGHT -> Column(
+                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 14.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                NightChips(c)
+                Spacer(Modifier.height(10.dp))
+                ZoomChips(c, rotation, Modifier)
+            }
             else -> ZoomChips(c, rotation, Modifier.align(Alignment.BottomCenter).padding(bottom = 14.dp))
         }
         if (c.recording) RecordingPill(c, Modifier.align(Alignment.TopCenter).padding(top = 12.dp))
@@ -240,6 +248,15 @@ private fun VideoChips(c: CameraController) {
         Chip(if (c.videoStabilize) "Stable ✓" else "Stable", selected = c.videoStabilize) { c.toggleStabilize() }
         Chip(if (c.videoEnhance) "Enhance ✓" else "Enhance", selected = c.videoEnhance) { c.toggleEnhance() }
         Chip(if (c.video720) "720p" else "1080p", selected = false, enabled = !c.recording) { c.toggleVideoQuality() }
+    }
+}
+
+@Composable
+private fun NightChips(c: CameraController) {
+    val frames = if (c.front) 6 else 8
+    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        Chip("$frames frames", selected = !c.night16, enabled = !c.busy) { c.chooseNight16(false) }
+        Chip("${frames * 2} frames", selected = c.night16, enabled = !c.busy) { c.chooseNight16(true) }
     }
 }
 
@@ -646,14 +663,29 @@ private fun SettingsSheet(c: CameraController) {
             SettingRow("Mirror front photos", "Save selfies the way the viewfinder shows them", c.mirrorFront) { c.changeMirrorFront(it) }
             SettingRow("Clean selfies", "Front camera takes 4 quick shots and merges them for less grain", c.cleanSelfies) { c.changeCleanSelfies(it) }
             SettingRow("Shutter sound", null, c.shutterSound) { c.changeShutterSound(it) }
-            Spacer(Modifier.height(10.dp))
             val caps = c.caps
+            SettingRow(
+                "Natural detail",
+                if (caps != null && !caps.detailControl) {
+                    "This camera doesn't let apps switch off its smoothing"
+                } else {
+                    "Night, HDR and Clean selfies skip the camera's smoothing and sharpening — merging removes the grain and keeps fine detail"
+                },
+                c.naturalDetail,
+            ) { c.changeNaturalDetail(it) }
+            Spacer(Modifier.height(10.dp))
             if (caps != null) {
+                val smoothing = when (caps.rawNoise) {
+                    CaptureRequest.NOISE_REDUCTION_MODE_MINIMAL -> "minimal"
+                    CaptureRequest.NOISE_REDUCTION_MODE_OFF -> "off"
+                    else -> "fixed"
+                }
                 Label("This camera", color = Color.White.copy(alpha = 0.6f), size = 12.sp)
                 Spacer(Modifier.height(4.dp))
                 Label(
                     "Camera2 level: ${caps.level} · Manual ISO/shutter: ${if (caps.manualSensor) "yes" else "no"} · " +
-                        "Focus: ${if (caps.minFocus > 0f) "auto" else "fixed"} · Flash: ${if (caps.hasFlash) "yes" else "no"}",
+                        "Focus: ${if (caps.minFocus > 0f) "auto" else "fixed"} · Flash: ${if (caps.hasFlash) "yes" else "no"} · " +
+                        "Smoothing: $smoothing · Sharpening: ${if (caps.edgeOff) "can switch off" else "fixed"}",
                     color = Color.White.copy(alpha = 0.85f),
                     size = 12.sp,
                 )

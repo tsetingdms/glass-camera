@@ -11,13 +11,18 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
+import kotlin.math.ceil
+import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
 /** Tuning for one multi-frame mode. */
-class MergeParams(
-    /** Sum of the R+G+B differences (0..765) still treated as the same detail; above it a frame is ignored there. */
+data class MergeParams(
+    /**
+     * Smallest sum of the R+G+B differences (0..765) still treated as noise; above about twice the limit a frame is
+     * ignored there. The real limit is measured from the frames and only ever raised above this.
+     */
     val robust: Int,
     /** Average brightness (0..1) the picture is lifted towards. */
     val targetMean: Float,
@@ -38,11 +43,16 @@ class MergeParams(
     }
 }
 
+/** A merged picture and how many frames went into it (shaky or blurred ones are left out). */
+class Merged(val bitmap: Bitmap, val frames: Int)
+
 /**
  * A small HDR+-style pipeline for a budget phone:
  *  1. pick the sharpest frame as the reference,
- *  2. find each other frame's hand-shake offset (coarse-to-fine search on small grey copies),
- *  3. average the frames pixel by pixel, ignoring pixels that moved (no ghosts),
+ *  2. find each other frame's overall hand-shake offset (coarse-to-fine search on small grey copies), then refine it
+ *     per 64-pixel tile to sub-pixel precision, so a slightly rotated hand or a small movement still lines up,
+ *  3. measure how much the aligned frames differ from the reference at each brightness (their noise), then average
+ *     them pixel by pixel, ignoring pixels that differ by more than noise (something moved: no ghosts),
  *  4. local tone mapping: lift dark areas more than bright ones, then a little sharpening.
  * Works in horizontal strips decoded straight from the JPEGs, so memory stays at about one picture.
  */
@@ -52,44 +62,92 @@ object BurstMerge {
     private const val FINE = 2
     private const val CELL = 32
 
+    /** Alignment tile, in half-resolution pixels (64 full-resolution pixels). */
+    private const val TILE = 32
+
+    /** How far a tile may move away from its frame's overall offset, in half-resolution pixels. */
+    private const val TILE_RADIUS = 3
+
+    /** Extra frame rows a strip may need, because neighbouring tiles can be shifted by different amounts. */
+    private const val SLACK = 2 * (TILE_RADIUS + 2) * FINE
+
+    /** Brightness bands with their own noise limit. */
+    private const val BANDS = 8
+
+    /** Rounds offsets with a cheap cast (valid for values above −1024). */
+    private const val ROUND = 1024.5f
+    private const val BIAS = 1024
+
     private class Gray(val w: Int, val h: Int, val px: IntArray)
 
-    suspend fun merge(jpegs: List<ByteArray>, p: MergeParams, progress: (Float) -> Unit): Bitmap {
+    /** Offsets per tile, in full-resolution pixels: frame pixel (x + dx, y + dy) shows reference pixel (x, y). */
+    private class Motion(val cols: Int, val rows: Int, val dx: FloatArray, val dy: FloatArray)
+
+    /** Which tile centres each picture column and row lies between (the same for every frame). */
+    private class Grid(width: Int, height: Int, val cols: Int, val rows: Int) {
+        val x0 = IntArray(width)
+        val x1 = IntArray(width)
+        val fx = FloatArray(width)
+        val y0 = IntArray(height)
+        val y1 = IntArray(height)
+        val fy = FloatArray(height)
+
+        init {
+            val span = (TILE * FINE).toFloat()
+            for (x in 0 until width) {
+                val t = ((x + 0.5f) / span - 0.5f).coerceIn(0f, (cols - 1).toFloat())
+                x0[x] = t.toInt()
+                x1[x] = min(x0[x] + 1, cols - 1)
+                fx[x] = t - x0[x]
+            }
+            for (y in 0 until height) {
+                val t = ((y + 0.5f) / span - 0.5f).coerceIn(0f, (rows - 1).toFloat())
+                y0[y] = t.toInt()
+                y1[y] = min(y0[y] + 1, rows - 1)
+                fy[y] = t - y0[y]
+            }
+        }
+    }
+
+    suspend fun merge(jpegs: List<ByteArray>, p: MergeParams, progress: (Float) -> Unit): Merged {
         require(jpegs.isNotEmpty()) { "No frames" }
 
         val coarse = jpegs.map { decodeGray(it, COARSE) }
         val ref = coarse.indices.maxByOrNull { sharpness(coarse[it]) } ?: 0
         val (width, height) = bounds(jpegs[ref])
 
-        // Hand-shake offsets, in full-resolution pixels: frame pixel (x + dx, y + dy) shows reference pixel (x, y).
-        val shifts = arrayOfNulls<IntArray>(jpegs.size)
-        shifts[ref] = intArrayOf(0, 0)
         val refFine = decodeGray(jpegs[ref], FINE)
+        val cols = max(1, refFine.w / TILE)
+        val rows = max(1, refFine.h / TILE)
+        val motions = arrayOfNulls<Motion>(jpegs.size)
+        motions[ref] = Motion(cols, rows, FloatArray(cols * rows), FloatArray(cols * rows))
         for (i in jpegs.indices) {
             if (i != ref && bounds(jpegs[i]) == width to height) {
-                shifts[i] = align(coarse[ref], coarse[i], refFine, jpegs[i])
+                motions[i] = align(coarse[ref], coarse[i], refFine, jpegs[i], cols, rows)
             }
-            progress(0.15f * (i + 1) / jpegs.size)
+            progress(0.2f * (i + 1) / jpegs.size)
         }
 
+        val others = jpegs.indices.filter { it != ref && motions[it] != null }
+        val grid = Grid(width, height, cols, rows)
         val out = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-        val decoders = jpegs.mapIndexed { i, jpeg -> if (shifts[i] != null) regionDecoder(jpeg) else null }
+        val decoders = jpegs.mapIndexed { i, jpeg -> if (motions[i] != null) regionDecoder(jpeg) else null }
         try {
-            val others = jpegs.indices.filter { it != ref && shifts[it] != null }
+            val limits = noiseLimits(width, height, ref, others, motions, decoders, grid, p)
+            progress(0.25f)
             val strips = (height + STRIP - 1) / STRIP
             val next = AtomicInteger(0)
             val done = AtomicInteger(0)
-            val workers = max(1, min(4, Runtime.getRuntime().availableProcessors() - 1))
             coroutineScope {
-                (0 until workers).map {
+                (0 until workers()).map {
                     async(Dispatchers.Default) {
-                        val buffers = StripBuffers(width * STRIP)
+                        val buffers = StripBuffers(width, cols)
                         while (true) {
                             val s = next.getAndIncrement()
                             if (s >= strips) break
                             val y0 = s * STRIP
-                            mergeStrip(y0, min(height, y0 + STRIP), width, height, ref, others, shifts, decoders, p, out, buffers)
-                            progress(0.15f + 0.65f * done.incrementAndGet() / strips)
+                            mergeStrip(y0, min(height, y0 + STRIP), width, height, ref, others, motions, decoders, grid, limits, out, buffers)
+                            progress(0.25f + 0.55f * done.incrementAndGet() / strips)
                         }
                     }
                 }.awaitAll()
@@ -99,19 +157,22 @@ object BurstMerge {
         }
 
         tone(out, p) { progress(0.8f + 0.2f * it) }
-        return out
+        return Merged(out, 1 + others.size)
     }
+
+    private fun workers() = max(1, min(4, Runtime.getRuntime().availableProcessors() - 1))
 
     // region Alignment
 
-    private fun align(refCoarse: Gray, frameCoarse: Gray, refFine: Gray, jpeg: ByteArray): IntArray? {
+    private suspend fun align(refCoarse: Gray, frameCoarse: Gray, refFine: Gray, jpeg: ByteArray, cols: Int, rows: Int): Motion? {
         val c = search(refCoarse, frameCoarse, 0, 0, radius = 10, margin = refCoarse.w / 8, step = 2)
         val frameFine = decodeGray(jpeg, FINE)
+        if (frameFine.w != refFine.w || frameFine.h != refFine.h) return null
         val k = COARSE / FINE
         val f = search(refFine, frameFine, c[0] * k, c[1] * k, radius = 4, margin = refFine.w / 4, step = 2)
         // Too different even at the best offset (moved a lot, or blurred): leave this frame out.
         if (f[2] > 22 * 1024) return null
-        return intArrayOf(f[0] * FINE, f[1] * FINE)
+        return tiles(refFine, frameFine, f[0], f[1], cols, rows)
     }
 
     /** Best offset (dx, dy) of [b] against [a] around (gx, gy), plus its mean difference × 1024. */
@@ -154,6 +215,121 @@ object BurstMerge {
         return intArrayOf(bx, by, if (best == Long.MAX_VALUE) Int.MAX_VALUE else best.toInt())
     }
 
+    /**
+     * Refines the frame's overall offset (gx, gy) for every tile (in parallel), then a 3×3 median replaces tiles
+     * that disagree with their neighbours. Tiles without a clear match keep the overall offset.
+     */
+    private suspend fun tiles(a: Gray, b: Gray, gx: Int, gy: Int, cols: Int, rows: Int): Motion {
+        val dx = FloatArray(cols * rows) { gx.toFloat() }
+        val dy = FloatArray(cols * rows) { gy.toFloat() }
+        val workers = workers()
+        coroutineScope {
+            (0 until workers).map { w ->
+                async(Dispatchers.Default) {
+                    val side = 2 * TILE_RADIUS + 1
+                    val sad = LongArray(side * side)
+                    val found = FloatArray(2)
+                    var ty = w
+                    while (ty < rows) {
+                        for (tx in 0 until cols) {
+                            if (refineTile(a, b, tx * TILE, ty * TILE, gx, gy, sad, found)) {
+                                dx[ty * cols + tx] = found[0]
+                                dy[ty * cols + tx] = found[1]
+                            }
+                        }
+                        ty += workers
+                    }
+                }
+            }.awaitAll()
+        }
+        val mx = median3x3(dx, cols, rows)
+        val my = median3x3(dy, cols, rows)
+        for (i in mx.indices) {
+            mx[i] *= FINE
+            my[i] *= FINE
+        }
+        return Motion(cols, rows, mx, my)
+    }
+
+    /**
+     * Searches ±[TILE_RADIUS] around (gx, gy) for the tile at (x0, y0) and writes the best offset, refined to
+     * sub-pixel precision with a parabola through its neighbours, into [result]. Returns false when there's no clear
+     * answer: plain areas (sky, walls) match everywhere about equally, and a best match on the edge of the search
+     * means the tile moved further than allowed.
+     */
+    private fun refineTile(a: Gray, b: Gray, x0: Int, y0: Int, gx: Int, gy: Int, sad: LongArray, result: FloatArray): Boolean {
+        val r = TILE_RADIUS
+        val side = 2 * r + 1
+        var best = Long.MAX_VALUE
+        var bi = 0
+        var total = 0L
+        for (j in 0 until side) {
+            val oy = gy + j - r
+            for (i in 0 until side) {
+                val ox = gx + i - r
+                var sum = 0L
+                var count = 0
+                var y = y0
+                while (y < y0 + TILE) {
+                    val yy = y + oy
+                    if (yy >= 0 && yy < b.h) {
+                        val ar = y * a.w
+                        val br = yy * b.w + ox
+                        var x = x0
+                        while (x < x0 + TILE) {
+                            val xx = x + ox
+                            if (xx >= 0 && xx < b.w) {
+                                sum += abs(a.px[ar + x] - b.px[br + x])
+                                count++
+                            }
+                            x += 2
+                        }
+                    }
+                    y += 2
+                }
+                // Mostly outside the frame (tile near the picture edge): no reliable answer.
+                if (count < 128) return false
+                val score = sum * 256 / count
+                sad[j * side + i] = score
+                total += score
+                if (score < best) {
+                    best = score
+                    bi = j * side + i
+                }
+            }
+        }
+        val bx = bi % side
+        val by = bi / side
+        if (bx == 0 || by == 0 || bx == side - 1 || by == side - 1) return false
+        if (best * 4 > total / (side * side) * 3) return false
+        result[0] = gx + bx - r + vertex(sad[bi - 1], best, sad[bi + 1])
+        result[1] = gy + by - r + vertex(sad[bi - side], best, sad[bi + side])
+        return true
+    }
+
+    /** Position (−0.5..0.5) of the lowest point of a parabola through three equally spaced scores. */
+    private fun vertex(left: Long, mid: Long, right: Long): Float {
+        val den = left - 2 * mid + right
+        if (den <= 0) return 0f
+        return (0.5f * (left - right) / den).coerceIn(-0.5f, 0.5f)
+    }
+
+    private fun median3x3(v: FloatArray, cols: Int, rows: Int): FloatArray {
+        val out = FloatArray(v.size)
+        val window = FloatArray(9)
+        for (y in 0 until rows) {
+            for (x in 0 until cols) {
+                var n = 0
+                for (j in max(0, y - 1)..min(rows - 1, y + 1)) {
+                    for (i in max(0, x - 1)..min(cols - 1, x + 1)) window[n++] = v[j * cols + i]
+                }
+                window.sort(0, n)
+                out[y * cols + x] = if (n % 2 == 1) window[n / 2] else 0.5f * (window[n / 2 - 1] + window[n / 2])
+            }
+        }
+        return out
+    }
+
     private fun sharpness(g: Gray): Long {
         var s = 0L
         for (y in 0 until g.h - 1 step 2) {
@@ -194,14 +370,18 @@ object BurstMerge {
 
     // region Merge
 
-    private class StripBuffers(size: Int) {
-        val ref = IntArray(size)
-        val frame = IntArray(size)
-        val out = IntArray(size)
-        val r = FloatArray(size)
-        val g = FloatArray(size)
-        val b = FloatArray(size)
-        val w = FloatArray(size)
+    private class StripBuffers(width: Int, cols: Int) {
+        val frameRows = STRIP + SLACK
+        val ref = IntArray(width * STRIP)
+        val frame = IntArray(width * frameRows)
+        val out = IntArray(width * STRIP)
+        val limit = IntArray(width * STRIP)
+        val r = FloatArray(width * STRIP)
+        val g = FloatArray(width * STRIP)
+        val b = FloatArray(width * STRIP)
+        val w = FloatArray(width * STRIP)
+        val rowDx = FloatArray(cols)
+        val rowDy = FloatArray(cols)
     }
 
     @Suppress("DEPRECATION")
@@ -224,6 +404,115 @@ object BurstMerge {
         return into
     }
 
+    private fun band(r: Int, g: Int, b: Int) = ((r * 77 + g * 150 + b * 29) shr 8) * BANDS shr 8
+
+    /**
+     * Decodes the part of a frame that lines up with reference rows [y0] until [y1] and calls [action] with each
+     * reference pixel's index in the strip and the frame's matching colour. Offsets are interpolated between tile
+     * centres, so the frame is gently warped rather than cut into blocks.
+     */
+    private inline fun eachAligned(
+        y0: Int,
+        y1: Int,
+        width: Int,
+        height: Int,
+        m: Motion,
+        grid: Grid,
+        decoder: BitmapRegionDecoder,
+        buf: StripBuffers,
+        action: (i: Int, color: Int) -> Unit,
+    ) {
+        val cols = m.cols
+        var lo = Float.MAX_VALUE
+        var hi = -Float.MAX_VALUE
+        for (k in grid.y0[y0] * cols until (grid.y1[y1 - 1] + 1) * cols) {
+            lo = min(lo, m.dy[k])
+            hi = max(hi, m.dy[k])
+        }
+        val fy0 = max(0, y0 + floor(lo).toInt() - 1)
+        val fy1 = min(height, min(y1 + ceil(hi).toInt() + 1, fy0 + buf.frameRows))
+        if (fy1 <= fy0) return
+        val px = decodeRegion(decoder, Rect(0, fy0, width, fy1), buf.frame)
+        val rowDx = buf.rowDx
+        val rowDy = buf.rowDy
+        for (y in y0 until y1) {
+            val ta = grid.y0[y] * cols
+            val tb = grid.y1[y] * cols
+            val wy = grid.fy[y]
+            for (c in 0 until cols) {
+                rowDx[c] = m.dx[ta + c] + (m.dx[tb + c] - m.dx[ta + c]) * wy
+                rowDy[c] = m.dy[ta + c] + (m.dy[tb + c] - m.dy[ta + c]) * wy
+            }
+            val base = (y - y0) * width
+            for (x in 0 until width) {
+                val ca = grid.x0[x]
+                val cb = grid.x1[x]
+                val wx = grid.fx[x]
+                val fx = x + (rowDx[ca] + (rowDx[cb] - rowDx[ca]) * wx + ROUND).toInt() - BIAS
+                val fy = y + (rowDy[ca] + (rowDy[cb] - rowDy[ca]) * wx + ROUND).toInt() - BIAS
+                if (fx < 0 || fx >= width || fy < fy0 || fy >= fy1) continue
+                action(base + x, px[(fy - fy0) * width + fx])
+            }
+        }
+    }
+
+    /**
+     * How different an aligned pixel may be and still count as noise, per brightness band: 1.7 × the median
+     * difference between the reference and up to two other frames over six sample strips. Frames without the
+     * camera's own smoothing are grainier, so the limit rises with them; it never drops below the mode's value.
+     */
+    private fun noiseLimits(
+        width: Int,
+        height: Int,
+        ref: Int,
+        others: List<Int>,
+        motions: Array<Motion?>,
+        decoders: List<BitmapRegionDecoder?>,
+        grid: Grid,
+        p: MergeParams,
+    ): IntArray {
+        val fallback = IntArray(BANDS) { p.robust }
+        if (others.isEmpty()) return fallback
+        val hist = Array(BANDS) { IntArray(766) }
+        val buf = StripBuffers(width, grid.cols)
+        val sampleRows = 32
+        val samples = 6
+        for (s in 0 until samples) {
+            val y0 = ((height - sampleRows) * (s + 0.5f) / samples).toInt().coerceIn(0, max(0, height - sampleRows))
+            val y1 = min(height, y0 + sampleRows)
+            if (y1 <= y0) continue
+            val refPx = decodeRegion(decoders[ref]!!, Rect(0, y0, width, y1), buf.ref)
+            for (k in others.take(2)) {
+                eachAligned(y0, y1, width, height, motions[k]!!, grid, decoders[k]!!, buf) { i, c ->
+                    val r0 = refPx[i]
+                    val rr = r0 shr 16 and 255
+                    val gg = r0 shr 8 and 255
+                    val bb = r0 and 255
+                    val d = abs((c shr 16 and 255) - rr) + abs((c shr 8 and 255) - gg) + abs((c and 255) - bb)
+                    hist[band(rr, gg, bb)][d]++
+                }
+            }
+        }
+        val all = IntArray(766)
+        for (h in hist) for (d in all.indices) all[d] += h[d]
+        val overall = median(all) ?: return fallback
+        return IntArray(BANDS) { b ->
+            val med = if (hist[b].sum() >= 4000) median(hist[b]) ?: overall else overall
+            max(p.robust, min(150, (med * 1.7f).roundToInt()))
+        }
+    }
+
+    private fun median(hist: IntArray): Int? {
+        val total = hist.sum()
+        if (total == 0) return null
+        var acc = 0
+        for (d in hist.indices) {
+            acc += hist[d]
+            if (acc * 2 >= total) return d
+        }
+        return hist.size - 1
+    }
+
     private fun mergeStrip(
         y0: Int,
         y1: Int,
@@ -231,9 +520,10 @@ object BurstMerge {
         height: Int,
         ref: Int,
         others: List<Int>,
-        shifts: Array<IntArray?>,
+        motions: Array<Motion?>,
         decoders: List<BitmapRegionDecoder?>,
-        p: MergeParams,
+        grid: Grid,
+        limits: IntArray,
         out: Bitmap,
         buf: StripBuffers,
     ) {
@@ -244,49 +534,37 @@ object BurstMerge {
         val sg = buf.g
         val sb = buf.b
         val sw = buf.w
+        val limit = buf.limit
         for (i in 0 until n) {
             val c = refPx[i]
-            sr[i] = (c shr 16 and 255).toFloat()
-            sg[i] = (c shr 8 and 255).toFloat()
-            sb[i] = (c and 255).toFloat()
+            val r = c shr 16 and 255
+            val g = c shr 8 and 255
+            val b = c and 255
+            sr[i] = r.toFloat()
+            sg[i] = g.toFloat()
+            sb[i] = b.toFloat()
             sw[i] = 1f
+            limit[i] = limits[band(r, g, b)]
         }
 
-        val t = p.robust
         for (k in others) {
-            val dx = shifts[k]!![0]
-            val dy = shifts[k]!![1]
-            val fy0 = max(0, y0 + dy)
-            val fy1 = min(height, y1 + dy)
-            val fx0 = max(0, dx)
-            val fx1 = min(width, width + dx)
-            if (fy1 <= fy0 || fx1 <= fx0) continue
-            val rw = fx1 - fx0
-            val px = decodeRegion(decoders[k]!!, Rect(fx0, fy0, fx1, fy1), buf.frame)
-            for (fy in fy0 until fy1) {
-                val ry = fy - dy - y0
-                if (ry < 0 || ry >= h) continue
-                val src = (fy - fy0) * rw - fx0
-                val dst = ry * width - dx
-                for (fx in fx0 until fx1) {
-                    val c = px[src + fx]
-                    val i = dst + fx
-                    val r0 = refPx[i]
-                    val cr = c shr 16 and 255
-                    val cg = c shr 8 and 255
-                    val cb = c and 255
-                    val d = abs(cr - (r0 shr 16 and 255)) + abs(cg - (r0 shr 8 and 255)) + abs(cb - (r0 and 255))
-                    val weight = when {
-                        d <= t -> 1f
-                        d >= 2 * t -> 0f
-                        else -> (2 * t - d).toFloat() / t
-                    }
-                    if (weight > 0f) {
-                        sr[i] += cr * weight
-                        sg[i] += cg * weight
-                        sb[i] += cb * weight
-                        sw[i] += weight
-                    }
+            eachAligned(y0, y1, width, height, motions[k]!!, grid, decoders[k]!!, buf) { i, c ->
+                val r0 = refPx[i]
+                val cr = c shr 16 and 255
+                val cg = c shr 8 and 255
+                val cb = c and 255
+                val d = abs(cr - (r0 shr 16 and 255)) + abs(cg - (r0 shr 8 and 255)) + abs(cb - (r0 and 255))
+                val t = limit[i]
+                val weight = when {
+                    d <= t -> 1f
+                    d >= 2 * t -> 0f
+                    else -> (2 * t - d).toFloat() / t
+                }
+                if (weight > 0f) {
+                    sr[i] += cr * weight
+                    sg[i] += cg * weight
+                    sb[i] += cb * weight
+                    sw[i] += weight
                 }
             }
         }

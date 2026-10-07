@@ -102,8 +102,15 @@ class Caps(
     val evRange: Range<Int>,
     val evStep: Float,
     val hasFlash: Boolean,
+    /** Lightest noise reduction apps may ask the chip for (MINIMAL, else OFF); null = only its own smoothing. */
+    val rawNoise: Int?,
+    /** The chip's sharpening can be switched off. */
+    val edgeOff: Boolean,
 ) {
     val manualFocus get() = manualSensor && minFocus > 0f
+
+    /** Merged shots can skip some of the chip's processing ("Natural detail"). */
+    val detailControl get() = rawNoise != null || edgeOff
 }
 
 private class Shot(val jpeg: ByteArray, val rotation: Int)
@@ -144,6 +151,14 @@ class CameraController(private val activity: ComponentActivity) {
     var cleanSelfies by mutableStateOf(prefs.getBoolean("cleanSelfies", true))
         private set
     var shutterSound by mutableStateOf(prefs.getBoolean("shutterSound", true))
+        private set
+
+    /** Night takes twice as many frames (16 on the back camera). */
+    var night16 by mutableStateOf(prefs.getBoolean("night16", false))
+        private set
+
+    /** Merged shots ask the chip for unsmoothed, unsharpened frames; the merge removes the grain instead. */
+    var naturalDetail by mutableStateOf(prefs.getBoolean("naturalDetail", true))
         private set
 
     // Video
@@ -359,6 +374,8 @@ class CameraController(private val activity: ComponentActivity) {
             else -> "Unknown"
         }
         val capabilities = info.getCameraCharacteristic(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: IntArray(0)
+        val noiseModes = info.getCameraCharacteristic(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES) ?: IntArray(0)
+        val edgeModes = info.getCameraCharacteristic(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES) ?: IntArray(0)
         val exposure = cam.cameraInfo.exposureState
         return Caps(
             level = level,
@@ -371,6 +388,13 @@ class CameraController(private val activity: ComponentActivity) {
             evRange = if (exposure.isExposureCompensationSupported) exposure.exposureCompensationRange else Range(0, 0),
             evStep = exposure.exposureCompensationStep.toFloat().takeIf { it > 0f } ?: (1f / 3f),
             hasFlash = cam.cameraInfo.hasFlashUnit(),
+            // MINIMAL still removes sensor defects (hot pixels) but doesn't smear detail.
+            rawNoise = when {
+                CameraMetadata.NOISE_REDUCTION_MODE_MINIMAL in noiseModes -> CameraMetadata.NOISE_REDUCTION_MODE_MINIMAL
+                CameraMetadata.NOISE_REDUCTION_MODE_OFF in noiseModes -> CameraMetadata.NOISE_REDUCTION_MODE_OFF
+                else -> null
+            },
+            edgeOff = CameraMetadata.EDGE_MODE_OFF in edgeModes,
         )
     }
 
@@ -478,6 +502,18 @@ class CameraController(private val activity: ComponentActivity) {
     fun changeShutterSound(on: Boolean) {
         shutterSound = on
         prefs.edit { putBoolean("shutterSound", on) }
+    }
+
+    fun chooseNight16(on: Boolean) {
+        if (busy || on == night16) return
+        night16 = on
+        prefs.edit { putBoolean("night16", on) }
+        message = if (on) "Cleaner night photos — hold still about twice as long" else "Quicker night photos"
+    }
+
+    fun changeNaturalDetail(on: Boolean) {
+        naturalDetail = on
+        prefs.edit { putBoolean("naturalDetail", on) }
     }
 
     fun zoomTo(value: Float) {
@@ -717,7 +753,7 @@ class CameraController(private val activity: ComponentActivity) {
             else -> Burst.CLEAN
         }
         val count = when (kind) {
-            Burst.NIGHT -> if (front) 6 else 8
+            Burst.NIGHT -> (if (front) 6 else 8) * (if (night16) 2 else 1)
             Burst.HDR -> 4
             Burst.CLEAN -> 4
         }
@@ -729,19 +765,20 @@ class CameraController(private val activity: ComponentActivity) {
         } else {
             0
         }
-        if (ev != 0) {
-            runCatching { cam.cameraControl.setExposureCompensationIndex(ev).awaitResult() }
-            delay(500)
-        }
+        if (ev != 0) runCatching { cam.cameraControl.setExposureCompensationIndex(ev).awaitResult() }
+        val natural = naturalDetail && c != null && c.detailControl &&
+            runCatching { chipProcessing(cam, natural = true) }.isSuccess
+        if (ev != 0 || natural) delay(if (ev != 0) 500 else 250)
 
         val shots = ArrayList<Shot>(count)
         try {
             for (i in 0 until count) {
-                status = Status(kind.holdText, 0.5f * i / count)
+                status = Status("${kind.holdText} ${i + 1}/$count", 0.5f * i / count)
                 shots += grab(ic)
             }
         } finally {
             if (ev != 0) runCatching { cam.cameraControl.setExposureCompensationIndex(0) }
+            if (natural) runCatching { chipProcessing(cam, natural = false) }
         }
         screenFlash = false
 
@@ -749,14 +786,36 @@ class CameraController(private val activity: ComponentActivity) {
         val rotation = shots.first().rotation
         val jpegs = shots.map { it.jpeg }
         shots.clear()
+        // Without the chip's sharpening the merge sharpens a little more itself.
+        val params = if (natural && c?.edgeOff == true) kind.params.copy(sharpen = kind.params.sharpen * 1.5f) else kind.params
         val merged = withContext(Dispatchers.Default) {
-            BurstMerge.merge(jpegs, kind.params) { f -> post { status = Status("Processing…", 0.5f + 0.5f * f) } }
+            BurstMerge.merge(jpegs, params) { f -> post { status = Status("Processing…", 0.5f + 0.5f * f) } }
         }
         try {
-            saved(ImageSaver.saveBitmap(activity, merged, rotation, mirror))
+            saved(ImageSaver.saveBitmap(activity, merged.bitmap, rotation, mirror))
         } finally {
-            merged.recycle()
+            merged.bitmap.recycle()
         }
+        if (merged.frames < count) message = "Used ${merged.frames} of $count frames — the others were shaky"
+    }
+
+    /**
+     * Natural detail: asks the chip to skip its noise smoothing and sharpening for the burst (the merge averages the
+     * grain away and keeps the fine detail the smoothing would smear), or returns it to normal. Never used in Pro
+     * mode, whose own capture options would be cleared.
+     */
+    @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
+    private suspend fun chipProcessing(cam: Camera, natural: Boolean) {
+        val control = Camera2CameraControl.from(cam.cameraControl)
+        val c = caps
+        if (!natural || c == null) {
+            control.clearCaptureRequestOptions().awaitResult()
+            return
+        }
+        val options = CaptureRequestOptions.Builder()
+        c.rawNoise?.let { options.setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, it) }
+        if (c.edgeOff) options.setCaptureRequestOption(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_OFF)
+        control.setCaptureRequestOptions(options.build()).awaitResult()
     }
 
     private suspend fun portrait(ic: ImageCapture, mirror: Boolean) {
