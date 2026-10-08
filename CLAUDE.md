@@ -40,6 +40,11 @@ There's no Android SDK on the owner's PC, so builds run on GitHub: `gh workflow 
     `CameraController.chipProcessing` sets NOISE_REDUCTION_MODE (MINIMAL, else OFF; the E40 only has OFF) through
     `Camera2CameraControl` only for the burst, then clears the options (bursts never run in Pro).
     Chip sharpening (EDGE_MODE) stays on: switching it off made E40 photos ~15 % softer. Support = `Caps.rawNoise`.
+  - `ai/SceneDetector.kt` — `Scene` enum + ImageAnalysis analyzer: ML Kit image labeling (bundled base model,
+    `image-labeling:17.0.9`) on a 640×480 frame every 0.7 s, labels → scene by weighted confidence (≥ 0.6, keyword
+    table from the official label map), reported after 2 identical results; paused while a photo is taken.
+  - `process/SceneLook.kt` — per-scene `Look` (vibrance-style saturation, warmth, mid-tone S-curve, green/blue
+    boost) applied in place to the finished bitmap, parallel 64-row strips.
   - `process/Portrait.kt` — ML Kit selfie segmentation on a 512 px upright copy, mask mapped back to the stored
     orientation, background blurred at 1/8 with weights excluding the person (no halo), feathered composite.
   - `process/ImageSaver.kt` — MediaStore (DCIM/Glass Camera, no storage permission; `IS_PENDING`), EXIF orientation
@@ -67,6 +72,9 @@ There's no Android SDK on the owner's PC, so builds run on GitHub: `gh workflow 
   material-icons-extended (R8 strips unused).
 - Manifest removes INTERNET / ACCESS_NETWORK_STATE that ML Kit brings in; keep the app offline.
 - `largeHeap` is on for the 12 MP merges.
+- AI scenes bind a third use case (ImageAnalysis) only in Photo (not 48M), Night and Portrait with AI on
+  (`usesAi()`/`boundAi`); if the camera refuses three streams it rebinds without it. With a scene detected, single
+  Photo shots go through `grab()` + decode + `SceneLook` + re-encode instead of saving the chip's file directly.
 - Video mode binds Preview (16:9) + VideoCapture (Recorder: FHD/HD, 20/10 Mbit/s) + the effect; no ImageCapture there.
   Mode switches into/out of Video rebind. Mic permission is asked once on first Video use; without it videos are silent.
   A recording ended by leaving the app finalizes with ERROR_SOURCE_INACTIVE but the file is kept.

@@ -80,6 +80,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import com.tsetingdms.glasscamera.ai.Scene
 import com.tsetingdms.glasscamera.camera.CameraController
 import com.tsetingdms.glasscamera.camera.FlashMode
 import com.tsetingdms.glasscamera.camera.Mode
@@ -236,6 +237,9 @@ private fun Viewfinder(c: CameraController, rotation: Float) {
             else -> ZoomChips(c, rotation, Modifier.align(Alignment.BottomCenter).padding(bottom = 14.dp))
         }
         if (c.recording) RecordingPill(c, Modifier.align(Alignment.TopCenter).padding(top = 12.dp))
+        if (c.aiHere) {
+            Box(Modifier.align(Alignment.TopStart).padding(12.dp)) { AiPill(c) }
+        }
         if (c.countdown > 0) {
             Label(
                 text = c.countdown.toString(),
@@ -254,6 +258,17 @@ private fun VideoChips(c: CameraController) {
         Chip(if (c.videoEnhance) "Enhance ✓" else "Enhance", selected = c.videoEnhance) { c.toggleEnhance() }
         Chip(if (c.video720) "720p" else "1080p", selected = false, enabled = !c.recording) { c.toggleVideoQuality() }
     }
+}
+
+/** What AI scene detection sees ("AI · Food"); tap to switch AI scenes on or off. */
+@Composable
+private fun AiPill(c: CameraController) {
+    val text = when {
+        !c.aiScene -> "AI off"
+        c.scene == Scene.NONE -> "AI"
+        else -> "AI · ${c.scene.label}"
+    }
+    Chip(text, selected = c.aiScene && c.scene != Scene.NONE, enabled = !c.busy) { c.toggleAi() }
 }
 
 @Composable
@@ -668,6 +683,11 @@ private fun SettingsSheet(c: CameraController) {
             SettingRow("Mirror front photos", "Save selfies the way the viewfinder shows them", c.mirrorFront) { c.changeMirrorFront(it) }
             SettingRow("Clean selfies", "Front camera takes 4 quick shots and merges them for less grain", c.cleanSelfies) { c.changeCleanSelfies(it) }
             SettingRow("Shutter sound", null, c.shutterSound) { c.changeShutterSound(it) }
+            SettingRow(
+                "AI scenes",
+                "Recognises food, plants, landscapes, sunsets, people, animals and text, and tunes colours for them — on the phone, offline",
+                c.aiScene,
+            ) { if (it != c.aiScene) c.toggleAi() }
             val caps = c.caps
             SettingRow(
                 "Natural detail",

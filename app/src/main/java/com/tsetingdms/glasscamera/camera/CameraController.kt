@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraMetadata
@@ -26,6 +27,7 @@ import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.FocusMeteringAction
+import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
@@ -55,10 +57,14 @@ import androidx.core.content.ContextCompat
 import androidx.core.content.edit
 import androidx.lifecycle.lifecycleScope
 import com.google.common.util.concurrent.ListenableFuture
+import com.tsetingdms.glasscamera.ai.Scene
+import com.tsetingdms.glasscamera.ai.SceneDetector
 import com.tsetingdms.glasscamera.process.BurstMerge
 import com.tsetingdms.glasscamera.process.ImageSaver
+import com.tsetingdms.glasscamera.process.Look
 import com.tsetingdms.glasscamera.process.MergeParams
 import com.tsetingdms.glasscamera.process.Portrait
+import com.tsetingdms.glasscamera.process.SceneLook
 import com.tsetingdms.glasscamera.video.VideoEffect
 import com.tsetingdms.glasscamera.video.VideoProcessor
 import kotlinx.coroutines.CancellationException
@@ -165,6 +171,14 @@ class CameraController(private val activity: ComponentActivity) {
     var hiRes by mutableStateOf(prefs.getBoolean("hiRes", false))
         private set
 
+    /** AI scenes: recognise what's in front of the camera and tune the photo's colours for it. */
+    var aiScene by mutableStateOf(prefs.getBoolean("aiScene", true))
+        private set
+
+    /** The scene AI detection currently sees (NONE when off or unsure). */
+    var scene by mutableStateOf(Scene.NONE)
+        private set
+
     /** Night asks the chip for unsmoothed frames; merging 8–16 of them removes the grain instead. */
     var naturalDetail by mutableStateOf(prefs.getBoolean("naturalDetail", true))
         private set
@@ -239,6 +253,9 @@ class CameraController(private val activity: ComponentActivity) {
     private var effect: VideoEffect? = null
     private var boundBurst = false
     private var boundHiRes = false
+    private var boundAi = false
+    private var detector: SceneDetector? = null
+    private val analysisExecutor: Executor = Executors.newSingleThreadExecutor()
 
     /** Say which resolution was bound after the next bind (the user just switched 48 MP on). */
     private var announceHiRes = false
@@ -259,6 +276,12 @@ class CameraController(private val activity: ComponentActivity) {
         .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
         .setResolutionStrategy(ResolutionStrategy.HIGHEST_AVAILABLE_STRATEGY)
         .setAllowedResolutionMode(ResolutionSelector.PREFER_HIGHER_RESOLUTION_OVER_CAPTURE_RATE)
+        .build()
+
+    // Small frames are plenty to recognise a scene and cheap to label.
+    private val analysisSelector = ResolutionSelector.Builder()
+        .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+        .setResolutionStrategy(ResolutionStrategy(Size(640, 480), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
         .build()
 
     // Largest 4:3 picture up to ~13 MP: the sensor's binned 12 MP mode is its cleanest, and it keeps
@@ -301,6 +324,17 @@ class CameraController(private val activity: ComponentActivity) {
 
     private fun usesHiRes() = hiRes && mode == Mode.PHOTO && !front
 
+    /** Modes whose photos get AI scene tuning (not 48 MP: too big to adjust in memory; not Pro, Video). */
+    val aiHere get() = when (mode) {
+        Mode.PHOTO -> !(hiRes && !front)
+        Mode.NIGHT, Mode.PORTRAIT -> true
+        else -> false
+    }
+
+    private fun usesAi() = aiScene && aiHere
+
+    private fun sceneDetector() = detector ?: SceneDetector { s -> scene = if (usesAi()) s else Scene.NONE }.also { detector = it }
+
     private fun usesBurst() = when (mode) {
         Mode.NIGHT -> true
         Mode.PHOTO -> (hdr && !usesHiRes()) || (front && cleanSelfies)
@@ -312,6 +346,7 @@ class CameraController(private val activity: ComponentActivity) {
         val view = previewView ?: return
         val burst = usesBurst()
         val full = usesHiRes()
+        val ai = usesAi()
         try {
             p.unbindAll()
             torch = false
@@ -329,23 +364,48 @@ class CameraController(private val activity: ComponentActivity) {
                 .setJpegQuality(95)
                 .setTargetRotation(deviceRotation)
                 .build()
+            val analysis = if (ai) {
+                ImageAnalysis.Builder()
+                    .setResolutionSelector(analysisSelector)
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .build()
+                    .also { it.setAnalyzer(analysisExecutor, sceneDetector()) }
+            } else {
+                null
+            }
+            detector?.reset()
             val selector = if (front) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
             val cam = try {
-                p.bindToLifecycle(activity, selector, preview, capture)
+                if (analysis != null) {
+                    p.bindToLifecycle(activity, selector, preview, capture, analysis)
+                } else {
+                    p.bindToLifecycle(activity, selector, preview, capture)
+                }
             } catch (e: IllegalArgumentException) {
-                if (!full) throw e
-                // The camera can't stream the viewfinder alongside full-resolution photos: back to normal size.
-                hiRes = false
-                prefs.edit { putBoolean("hiRes", false) }
-                announceHiRes = false
-                message = "This phone can't take full-resolution photos in this app"
-                bind()
-                return
+                when {
+                    analysis != null -> {
+                        // No room for a third camera stream: photos without AI scenes.
+                        message = "AI scenes aren't available with this camera"
+                        p.unbindAll()
+                        p.bindToLifecycle(activity, selector, preview, capture)
+                    }
+                    full -> {
+                        // The camera can't stream the viewfinder alongside full-resolution photos: back to normal size.
+                        hiRes = false
+                        prefs.edit { putBoolean("hiRes", false) }
+                        announceHiRes = false
+                        message = "This phone can't take full-resolution photos in this app"
+                        bind()
+                        return
+                    }
+                    else -> throw e
+                }
             }
             camera = cam
             imageCapture = capture
             boundBurst = burst
             boundHiRes = full
+            boundAi = ai
             caps = readCaps(cam)
             if (announceHiRes) {
                 announceHiRes = false
@@ -393,6 +453,8 @@ class CameraController(private val activity: ComponentActivity) {
         videoCapture = video
         boundBurst = false
         boundHiRes = false
+        boundAi = false
+        detector?.reset()
         caps = readCaps(cam)
         cam.cameraInfo.zoomState.observe(activity) { state ->
             zoom = state.zoomRatio
@@ -403,7 +465,7 @@ class CameraController(private val activity: ComponentActivity) {
     }
 
     private fun rebindIfNeeded() {
-        if (usesBurst() != boundBurst || usesHiRes() != boundHiRes) bind() else applyPro()
+        if (usesBurst() != boundBurst || usesHiRes() != boundHiRes || usesAi() != boundAi) bind() else applyPro()
     }
 
     @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
@@ -535,6 +597,15 @@ class CameraController(private val activity: ComponentActivity) {
         }
         announceHiRes = hiRes
         if (!hiRes) message = "12 MP: cleaner in low light, smaller files"
+        rebindIfNeeded()
+    }
+
+    fun toggleAi() {
+        if (busy) return
+        aiScene = !aiScene
+        prefs.edit { putBoolean("aiScene", aiScene) }
+        if (!aiScene) scene = Scene.NONE
+        message = if (aiScene) "AI scenes on: colours tuned for food, plants, sky, people…" else "AI scenes off"
         rebindIfNeeded()
     }
 
@@ -702,6 +773,7 @@ class CameraController(private val activity: ComponentActivity) {
         }
         if (busy || camera == null || imageCapture == null) return
         busy = true
+        detector?.paused = true
         activity.lifecycleScope.launch {
             try {
                 if (timer > 0) {
@@ -723,12 +795,13 @@ class CameraController(private val activity: ComponentActivity) {
                 screenFlash = false
                 status = null
                 busy = false
+                detector?.paused = false
             }
         }
     }
 
     private suspend fun capture() {
-        if (usesBurst() != boundBurst || usesHiRes() != boundHiRes) bind()
+        if (usesBurst() != boundBurst || usesHiRes() != boundHiRes || usesAi() != boundAi) bind()
         val ic = imageCapture ?: return
         val mirror = front && mirrorFront
 
@@ -749,14 +822,38 @@ class CameraController(private val activity: ComponentActivity) {
         }
         if (shutterSound) sound.play(MediaActionSound.SHUTTER_CLICK)
 
+        // The scene seen when the shutter fired decides the photo's tuning.
+        val shotScene = if (usesAi()) scene else Scene.NONE
+        val look = SceneLook.of(shotScene)
         when {
-            mode == Mode.PORTRAIT -> portrait(ic, mirror)
-            usesBurst() -> burst(ic, mirror)
+            mode == Mode.PORTRAIT -> portrait(ic, mirror, look)
+            usesBurst() -> burst(ic, mirror, look)
+            look != null -> singleWithLook(ic, mirror, look, shotScene)
             else -> {
                 val uri = single(ic, mirror)
                 screenFlash = false
                 saved(uri)
             }
+        }
+    }
+
+    /** One photo tuned for the AI scene: kept in memory, adjusted, then saved (the plain path saves the chip's file). */
+    private suspend fun singleWithLook(ic: ImageCapture, mirror: Boolean, look: Look, shotScene: Scene) {
+        val shot = grab(ic)
+        screenFlash = false
+        status = Status("AI · ${shotScene.label}", 0.6f)
+        val bitmap = withContext(Dispatchers.Default) {
+            BitmapFactory.decodeByteArray(shot.jpeg, 0, shot.jpeg.size, BitmapFactory.Options().apply { inMutable = true })
+        }
+        if (bitmap == null) {
+            saved(ImageSaver.saveJpeg(activity, shot.jpeg, shot.rotation, mirror))
+            return
+        }
+        try {
+            SceneLook.apply(bitmap, look)
+            saved(ImageSaver.saveBitmap(activity, bitmap, shot.rotation, mirror))
+        } finally {
+            bitmap.recycle()
         }
     }
 
@@ -810,7 +907,7 @@ class CameraController(private val activity: ComponentActivity) {
         })
     }
 
-    private suspend fun burst(ic: ImageCapture, mirror: Boolean) {
+    private suspend fun burst(ic: ImageCapture, mirror: Boolean, look: Look?) {
         val kind = when {
             mode == Mode.NIGHT -> Burst.NIGHT
             hdr -> Burst.HDR
@@ -856,6 +953,7 @@ class CameraController(private val activity: ComponentActivity) {
             BurstMerge.merge(jpegs, kind.params) { f -> post { status = Status("Processing…", 0.5f + 0.5f * f) } }
         }
         try {
+            if (look != null) SceneLook.apply(merged.bitmap, look)
             saved(ImageSaver.saveBitmap(activity, merged.bitmap, rotation, mirror))
         } finally {
             merged.bitmap.recycle()
@@ -881,7 +979,7 @@ class CameraController(private val activity: ComponentActivity) {
         control.setCaptureRequestOptions(options.build()).awaitResult()
     }
 
-    private suspend fun portrait(ic: ImageCapture, mirror: Boolean) {
+    private suspend fun portrait(ic: ImageCapture, mirror: Boolean, look: Look?) {
         val shot = grab(ic)
         screenFlash = false
         status = Status("Finding the person…", 0.15f)
@@ -890,6 +988,7 @@ class CameraController(private val activity: ComponentActivity) {
         }
         if (result != null) {
             try {
+                if (look != null) SceneLook.apply(result, look)
                 saved(ImageSaver.saveBitmap(activity, result, shot.rotation, mirror))
             } finally {
                 result.recycle()
@@ -987,6 +1086,8 @@ class CameraController(private val activity: ComponentActivity) {
         processor?.release()
         processor = null
         effect = null
+        detector?.close()
+        detector = null
     }
 
     // endregion

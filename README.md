@@ -21,6 +21,10 @@ Everything happens on the phone: no internet permission, no account, no tracking
   they are. HDR and Clean selfies (4 frames) keep the chip's smoothing. Settings → This camera shows whether the
   phone allows it.
 - **Portrait** — on-device person detection (ML Kit, offline) and a soft background blur.
+- **AI scenes** (Photo, Night, Portrait; on by default, tap the "AI" label to switch) — an offline ML Kit model
+  recognises food, plants, landscapes, sunsets, people, animals and text in the viewfinder ("AI · Food") and the
+  photo gets a mild matching look: richer food and sunsets, greener plants, bluer skies, gentler skin, crisper text.
+  Not in 48M (too big to adjust in memory) or Pro.
 - **Video** — 1080p (or 720p) at a high bitrate, with sound. **Stable**: GCam-style software stabilization — each
   frame's hand shake is measured against the previous one and cancelled within a 15 % crop. **Enhance**: local tone
   mapping (brighter shadows, kept highlights) and motion-aware temporal noise reduction. Both run on the GPU and apply

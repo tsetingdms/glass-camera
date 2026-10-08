@@ -15,8 +15,8 @@ android {
         // MediaStore RELATIVE_PATH / IS_PENDING (no storage permission needed) start at Android 10.
         minSdk = 29
         targetSdk = 36
-        versionCode = 7
-        versionName = "1.3.0"
+        versionCode = 8
+        versionName = "1.4.0"
         // The Moto E40 and nearly every phone since 2017 are ARM; ML Kit's native libraries for x86 aren't needed.
         ndk {
             abiFilters += listOf("armeabi-v7a", "arm64-v8a")
@@ -75,4 +75,7 @@ dependencies {
 
     // On-device person segmentation for Portrait mode (model bundled in the APK, works offline).
     implementation("com.google.mlkit:segmentation-selfie:16.0.0-beta6")
+
+    // On-device scene recognition for AI scenes (base model bundled in the APK, works offline).
+    implementation("com.google.mlkit:image-labeling:17.0.9")
 }
