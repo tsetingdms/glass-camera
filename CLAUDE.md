@@ -45,6 +45,14 @@ There's no Android SDK on the owner's PC, so builds run on GitHub: `gh workflow 
     table from the official label map), reported after 2 identical results; paused while a photo is taken.
   - `process/SceneLook.kt` — per-scene `Look` (vibrance-style saturation, warmth, mid-tone S-curve, green/blue
     boost) applied in place to the finished bitmap, parallel 64-row strips.
+  - `look/Looks.kt` — `ColorLook` enum (asset ids), `Lut` (33³ atlas PNG in `assets/looks/`: blue slices side by side,
+    red across, green down; + packed table) and `Looks.apply` (CPU, tetrahedral, strips, `amount` blend). The GPU
+    path is `VideoProcessor.lut`/`lutAmount` (atlas texture, `LUT_GLSL` in the output shaders, highp coordinates);
+    photo modes bind a second `VideoProcessor` (stabilize/enhance off) as a PREVIEW-only `VideoEffect` when a look
+    is on (`lookBinding()`/`boundLook`); video mode sets the look on its own processor (no rebind while recording).
+    Looks are off in 48M (`lookHere`) and switch AI scenes off (`aiHere`). `tools/fit_luts.py` rebuilds the atlases
+    from before/after slider screenshots (luminance-banded affine prior + 3D residual splat, chroma-limited
+    extrapolation); the reference screenshots aren't in the repo.
   - `process/Portrait.kt` — ML Kit selfie segmentation on a 512 px upright copy, mask mapped back to the stored
     orientation, background blurred at 1/8 with weights excluding the person (no halo), feathered composite.
   - `process/ImageSaver.kt` — MediaStore (DCIM/Glass Camera, no storage permission; `IS_PENDING`), EXIF orientation

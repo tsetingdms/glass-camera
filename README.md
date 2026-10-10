@@ -25,6 +25,10 @@ Everything happens on the phone: no internet permission, no account, no tracking
   recognises food, plants, landscapes, sunsets, people, animals and text in the viewfinder ("AI · Food") and the
   photo gets a mild matching look: richer food and sunsets, greener plants, bluer skies, gentler skin, crisper text.
   Not in 48M (too big to adjust in memory) or Pro.
+- **Looks** (palette button) — six colour grades (Amber, Pale Green, Harbour, Cyan, Golden, Neon) shown live in the
+  viewfinder in every mode, recorded into videos and applied to photos, at 100 / 75 / 50 % strength. They are 3D LUTs
+  fitted from before/after reference frames (`tools/fit_luts.py`). Not in 48M. While a look is on, AI scene tuning
+  pauses so the two don't stack. The grid switch moved to Settings.
 - **Video** — 1080p (or 720p) at a high bitrate, with sound. **Stable**: GCam-style software stabilization — each
   frame's hand shake is measured against the previous one and cancelled within a 15 % crop. **Enhance**: local tone
   mapping (brighter shadows, kept highlights) and motion-aware temporal noise reduction. Both run on the GPU and apply

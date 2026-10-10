@@ -4,6 +4,7 @@ import android.graphics.SurfaceTexture
 import android.opengl.EGLSurface
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
+import android.opengl.GLUtils
 import android.opengl.Matrix
 import android.os.Handler
 import android.os.HandlerThread
@@ -14,15 +15,19 @@ import androidx.camera.core.SurfaceOutput
 import androidx.camera.core.SurfaceProcessor
 import androidx.camera.core.SurfaceRequest
 import androidx.core.util.Consumer
+import com.tsetingdms.glasscamera.look.Lut
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.Executor
 import kotlin.math.abs
 import kotlin.math.max
 
-/** Runs [VideoProcessor] on the viewfinder and the recording, so what you see is what's recorded. */
-class VideoEffect(processor: VideoProcessor) : CameraEffect(
-    CameraEffect.PREVIEW or CameraEffect.VIDEO_CAPTURE,
+/**
+ * Runs [VideoProcessor] on the viewfinder and the recording (so what you see is what's recorded), or on the viewfinder
+ * only ([targets] = PREVIEW: photo modes with a colour look).
+ */
+class VideoEffect(processor: VideoProcessor, targets: Int = CameraEffect.PREVIEW or CameraEffect.VIDEO_CAPTURE) : CameraEffect(
+    targets,
     processor.executor,
     processor,
     Consumer { it.printStackTrace() },
@@ -36,6 +41,9 @@ class VideoEffect(processor: VideoProcessor) : CameraEffect(
  *   to follow the smooth path inside a 15 % crop margin.
  * - **Enhance**: local tone mapping (a blurred brightness map lifts dark areas more than bright ones)
  *   and motion-adaptive temporal noise reduction (blend with the previous frame where nothing moved).
+ *
+ * - **Look**: an optional colour look (3D LUT) applied as each output is drawn, after the denoise history, so the
+ *   temporal blend always compares ungraded frames.
  *
  * All positions are in "frame space": the camera image with the SurfaceTexture transform applied, before
  * each output's own rotation / crop / mirror (CameraX's [SurfaceOutput.updateTransformMatrix]). Measuring and
@@ -51,6 +59,16 @@ class VideoProcessor : SurfaceProcessor {
 
     @Volatile
     var enhance = true
+
+    /** Colour look for the outputs (null = none) and how strongly it's applied (0..1). */
+    @Volatile
+    var lut: Lut? = null
+
+    @Volatile
+    var lutAmount = 1f
+
+    private var lutTexture = 0
+    private var uploadedLut: Lut? = null
 
     private var egl: EglCore? = null
     private var programs: Programs? = null
@@ -151,6 +169,10 @@ class VideoProcessor : SurfaceProcessor {
         if (outputs.isEmpty()) return
         st.getTransformMatrix(stMatrix)
         val timestamp = st.timestamp
+        syncLut()
+        val look = uploadedLut?.let { if (lutAmount > 0f) it else null }
+        val amount = if (look != null) lutAmount else 0f
+        val lutSize = look?.size ?: 2
 
         val stab = stabilize
         val enh = enhance
@@ -161,7 +183,7 @@ class VideoProcessor : SurfaceProcessor {
                 output.updateTransformMatrix(outMatrix, stMatrix)
                 GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
                 GLES20.glViewport(0, 0, target.size.width, target.size.height)
-                p.drawOes(inputTexture, outMatrix)
+                p.drawOes(inputTexture, outMatrix, lutTexture, amount, lutSize)
                 core.present(target.surface, timestamp)
             }
             hasHistory = false
@@ -218,9 +240,29 @@ class VideoProcessor : SurfaceProcessor {
             Matrix.multiplyMM(drawMatrix, 0, inverseSt, 0, outMatrix, 0)
             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
             GLES20.glViewport(0, 0, target.size.width, target.size.height)
-            p.draw2d(write.texture, drawMatrix)
+            p.draw2d(write.texture, drawMatrix, lutTexture, amount, lutSize)
             core.present(target.surface, timestamp)
         }
+    }
+
+    /** Uploads a newly chosen look's atlas (GL thread). */
+    private fun syncLut() {
+        val wanted = lut
+        if (wanted === uploadedLut) return
+        uploadedLut = wanted
+        if (wanted == null) return
+        if (lutTexture == 0) {
+            val ids = IntArray(1)
+            GLES20.glGenTextures(1, ids, 0)
+            lutTexture = ids[0]
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, lutTexture)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        }
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, lutTexture)
+        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, wanted.atlas, 0)
     }
 
     private fun resetPath() {
@@ -379,6 +421,8 @@ class VideoProcessor : SurfaceProcessor {
                 quarter?.release()
                 small?.release()
                 history.forEach { it?.release() }
+                if (lutTexture != 0) GLES20.glDeleteTextures(1, intArrayOf(lutTexture), 0)
+                lutTexture = 0
                 programs?.release()
                 core.release()
             }
@@ -397,18 +441,28 @@ class VideoProcessor : SurfaceProcessor {
         private val down2d = Gl.program(VERTEX_PLAIN, FRAGMENT_DOWN_2D)
         private val process = Gl.program(VERTEX_PROCESS, FRAGMENT_PROCESS)
 
-        fun drawOes(texture: Int, matrix: FloatArray) {
+        fun drawOes(texture: Int, matrix: FloatArray, lut: Int, amount: Float, lutSize: Int) {
             GLES20.glUseProgram(copyOes)
             GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(copyOes, "uTexMatrix"), 1, false, matrix, 0)
             bindOes(0, texture, copyOes, "sTexture")
+            bindLut(copyOes, lut, amount, lutSize)
             Gl.drawQuad()
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         }
 
-        fun draw2d(texture: Int, matrix: FloatArray) {
+        fun draw2d(texture: Int, matrix: FloatArray, lut: Int, amount: Float, lutSize: Int) {
             GLES20.glUseProgram(copy2d)
             GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(copy2d, "uTexMatrix"), 1, false, matrix, 0)
             bind2d(0, texture, copy2d, "sTexture")
+            bindLut(copy2d, lut, amount, lutSize)
             Gl.drawQuad()
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        }
+
+        private fun bindLut(program: Int, lut: Int, amount: Float, lutSize: Int) {
+            GLES20.glUniform1f(GLES20.glGetUniformLocation(program, "uLutAmount"), if (lut != 0) amount else 0f)
+            GLES20.glUniform1f(GLES20.glGetUniformLocation(program, "uLutSize"), lutSize.toFloat())
+            bind2d(1, lut, program, "sLut")
         }
 
         fun downsampleOes(texture: Int, st: FloatArray, stepX: Float, stepY: Float) {
@@ -501,13 +555,39 @@ class VideoProcessor : SurfaceProcessor {
             }
         """
 
+        // Look: 3D LUT atlas (blue slices side by side, red across, green down); red/green interpolated by the
+        // texture filter, blue between two slices. Atlas coordinates need highp (1089 texels across).
+        const val LUT_GLSL = """
+            #ifdef GL_FRAGMENT_PRECISION_HIGH
+            #define LUTP highp
+            #else
+            #define LUTP mediump
+            #endif
+            uniform sampler2D sLut;
+            uniform float uLutAmount;
+            uniform LUTP float uLutSize;
+            vec3 graded(vec3 c) {
+                if (uLutAmount <= 0.0) return c;
+                LUTP vec3 v = clamp(c, 0.0, 1.0) * (uLutSize - 1.0);
+                LUTP float b0 = floor(v.b);
+                LUTP float b1 = min(b0 + 1.0, uLutSize - 1.0);
+                LUTP float x = v.r + 0.5;
+                LUTP float y = (v.g + 0.5) / uLutSize;
+                LUTP float w = uLutSize * uLutSize;
+                vec3 s0 = texture2D(sLut, vec2((b0 * uLutSize + x) / w, y)).rgb;
+                vec3 s1 = texture2D(sLut, vec2((b1 * uLutSize + x) / w, y)).rgb;
+                return mix(c, mix(s0, s1, v.b - b0), uLutAmount);
+            }
+        """
+
         const val FRAGMENT_OES = """
             #extension GL_OES_EGL_image_external : require
             precision mediump float;
             uniform samplerExternalOES sTexture;
             varying vec2 vUv;
+        """ + LUT_GLSL + """
             void main() {
-                gl_FragColor = texture2D(sTexture, vUv);
+                gl_FragColor = vec4(graded(texture2D(sTexture, vUv).rgb), 1.0);
             }
         """
 
@@ -515,8 +595,9 @@ class VideoProcessor : SurfaceProcessor {
             precision mediump float;
             uniform sampler2D sTexture;
             varying vec2 vUv;
+        """ + LUT_GLSL + """
             void main() {
-                gl_FragColor = texture2D(sTexture, vUv);
+                gl_FragColor = vec4(graded(texture2D(sTexture, vUv).rgb), 1.0);
             }
         """
 

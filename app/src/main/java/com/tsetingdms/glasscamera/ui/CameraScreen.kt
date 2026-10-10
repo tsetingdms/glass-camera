@@ -40,11 +40,10 @@ import androidx.compose.material.icons.rounded.Cameraswitch
 import androidx.compose.material.icons.rounded.FlashAuto
 import androidx.compose.material.icons.rounded.FlashOff
 import androidx.compose.material.icons.rounded.FlashOn
-import androidx.compose.material.icons.rounded.GridOff
-import androidx.compose.material.icons.rounded.GridOn
 import androidx.compose.material.icons.rounded.HdrOff
 import androidx.compose.material.icons.rounded.HdrOn
 import androidx.compose.material.icons.rounded.LightMode
+import androidx.compose.material.icons.rounded.Palette
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.Photo
@@ -88,6 +87,7 @@ import com.tsetingdms.glasscamera.camera.ProSetting
 import com.tsetingdms.glasscamera.camera.RecState
 import com.tsetingdms.glasscamera.camera.Status
 import com.tsetingdms.glasscamera.camera.evLabel
+import com.tsetingdms.glasscamera.look.ColorLook
 import kotlinx.coroutines.delay
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -161,7 +161,9 @@ private fun TopBar(c: CameraController, rotation: Float) {
                 else -> Icons.Rounded.TimerOff
             }
             BarIcon(timerIcon, if (c.timer == 0) "Timer off" else "Timer ${c.timer} seconds", rotation, active = c.timer > 0) { c.cycleTimer() }
-            BarIcon(if (c.grid) Icons.Rounded.GridOn else Icons.Rounded.GridOff, if (c.grid) "Grid on" else "Grid off", rotation, active = c.grid) { c.toggleGrid() }
+            if (c.lookHere) {
+                BarIcon(Icons.Rounded.Palette, "Looks", rotation, active = c.look != ColorLook.NONE) { c.lookStripOpen = !c.lookStripOpen }
+            }
             BarIcon(Icons.Rounded.Settings, "Settings", rotation) { c.settingsOpen = true }
         }
     }
@@ -216,25 +218,31 @@ private fun Viewfinder(c: CameraController, rotation: Float) {
         )
         if (c.grid) GridLines()
         focus?.let { FocusRing(it, focusKey) }
-        when (c.mode) {
-            Mode.PRO -> ProPanel(c, Modifier.align(Alignment.BottomCenter).padding(10.dp))
-            Mode.VIDEO -> Column(
-                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 14.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-                VideoChips(c)
+        Column(
+            modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 14.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            if (c.lookStripOpen && c.lookHere) {
+                LookStrip(c)
                 Spacer(Modifier.height(10.dp))
-                ZoomChips(c, rotation, Modifier)
             }
-            Mode.NIGHT -> Column(
-                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 14.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-                NightChips(c)
-                Spacer(Modifier.height(10.dp))
-                ZoomChips(c, rotation, Modifier)
+            when (c.mode) {
+                Mode.PRO -> ProPanel(c, Modifier.padding(horizontal = 10.dp))
+                Mode.VIDEO -> {
+                    VideoChips(c)
+                    Spacer(Modifier.height(10.dp))
+                    ZoomChips(c, rotation, Modifier)
+                }
+                Mode.NIGHT -> {
+                    NightChips(c)
+                    Spacer(Modifier.height(10.dp))
+                    ZoomChips(c, rotation, Modifier)
+                }
+                else -> ZoomChips(c, rotation, Modifier)
             }
-            else -> ZoomChips(c, rotation, Modifier.align(Alignment.BottomCenter).padding(bottom = 14.dp))
+        }
+        if (c.look != ColorLook.NONE && c.lookHere && !c.lookStripOpen) {
+            Box(Modifier.align(Alignment.TopEnd).padding(12.dp)) { Chip(c.look.label, selected = true) { c.lookStripOpen = true } }
         }
         if (c.recording) RecordingPill(c, Modifier.align(Alignment.TopCenter).padding(top = 12.dp))
         if (c.aiHere) {
@@ -257,6 +265,21 @@ private fun VideoChips(c: CameraController) {
         Chip(if (c.videoStabilize) "Stable ✓" else "Stable", selected = c.videoStabilize) { c.toggleStabilize() }
         Chip(if (c.videoEnhance) "Enhance ✓" else "Enhance", selected = c.videoEnhance) { c.toggleEnhance() }
         Chip(if (c.video720) "720p" else "1080p", selected = false, enabled = !c.recording) { c.toggleVideoQuality() }
+    }
+}
+
+/** Look chooser: tap a look to apply it live; the percentage sets how strongly. */
+@Composable
+private fun LookStrip(c: CameraController) {
+    Row(
+        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 10.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        if (c.look != ColorLook.NONE) {
+            Chip("${(c.lookStrength * 100).roundToInt()}%", selected = false, enabled = !c.busy) { c.cycleLookStrength() }
+        }
+        ColorLook.entries.forEach { l -> Chip(l.label, selected = c.look == l, enabled = !c.busy) { c.chooseLook(l) } }
     }
 }
 
@@ -683,6 +706,7 @@ private fun SettingsSheet(c: CameraController) {
             SettingRow("Mirror front photos", "Save selfies the way the viewfinder shows them", c.mirrorFront) { c.changeMirrorFront(it) }
             SettingRow("Clean selfies", "Front camera takes 4 quick shots and merges them for less grain", c.cleanSelfies) { c.changeCleanSelfies(it) }
             SettingRow("Shutter sound", null, c.shutterSound) { c.changeShutterSound(it) }
+            SettingRow("Grid lines", null, c.grid) { if (it != c.grid) c.toggleGrid() }
             SettingRow(
                 "AI scenes",
                 "Recognises food, plants, landscapes, sunsets, people, animals and text, and tunes colours for them — on the phone, offline",
